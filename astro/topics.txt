@@ -1,0 +1,9 @@
+# arXiv astro-ph topic filters (one per line, blank lines and # comments ignored)
+instrumentation
+mid-IR
+NIR
+protoplanetary disk
+debris disk
+polarization
+exoplanet
+JWST
