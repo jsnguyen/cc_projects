@@ -15,10 +15,28 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ALLOWED_USER = int(os.environ.get("TELEGRAM_USER_ID", "0"))
-SERVER_URL = "http://localhost:8433"
+CONFIG_PATH = Path.home() / ".sdr_tg.json"
+
+
+def load_config() -> dict:
+    """Load config from ~/.sdr_tg.json, fall back to env vars."""
+    config = {}
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+    return {
+        "bot_token": config.get("bot_token", os.environ.get("TELEGRAM_BOT_TOKEN", "")),
+        "user_id": int(config.get("user_id", os.environ.get("TELEGRAM_USER_ID", "0"))),
+        "server_url": config.get("server_url", os.environ.get("SDR_SERVER_URL", "http://localhost:8433")),
+    }
+
+
+cfg = load_config()
+BOT_TOKEN = cfg["bot_token"]
+ALLOWED_USER = cfg["user_id"]
+SERVER_URL = cfg["server_url"]
 POLL_TIMEOUT = 30
 
 
@@ -75,20 +93,22 @@ def handle_update(update: dict):
 
 
 def main():
-    if not BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN env var", file=sys.stderr)
-        sys.exit(1)
-    if not ALLOWED_USER:
-        print("Set TELEGRAM_USER_ID env var", file=sys.stderr)
-        sys.exit(1)
-
-    # Parse optional --url arg
     global SERVER_URL
+
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=SERVER_URL)
     args = parser.parse_args()
     SERVER_URL = args.url
+
+    if not BOT_TOKEN:
+        print(f"No bot token. Set in {CONFIG_PATH} or TELEGRAM_BOT_TOKEN env var.",
+              file=sys.stderr)
+        sys.exit(1)
+    if not ALLOWED_USER:
+        print(f"No user ID. Set in {CONFIG_PATH} or TELEGRAM_USER_ID env var.",
+              file=sys.stderr)
+        sys.exit(1)
 
     print(f"Bot started (user_id={ALLOWED_USER}, server={SERVER_URL})")
 
