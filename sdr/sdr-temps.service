@@ -3,16 +3,12 @@ Description=SDR Temperature Logger + Web Dashboard
 After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 User=jsn
 Environment=HOME=/home/jsn
 WorkingDirectory=/home/jsn/cc_projects/sdr
 
-ExecStart=/usr/bin/tmux new-session -d -s sdr \
-    "rtl_433 -F json -M time:iso 2>/dev/null | python3 temp_server.py --dir sdr"
-
-ExecStop=/usr/bin/tmux kill-session -t sdr
+ExecStart=/bin/bash -c 'rtl_433 -F json -M time:iso 2>/dev/null | python3 temp_server.py --dir sdr'
 
 TimeoutStartSec=30
 TimeoutStopSec=15

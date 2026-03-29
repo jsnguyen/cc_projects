@@ -1,0 +1,17 @@
+[Unit]
+Description=SDR Temperature Telegram Bot
+After=sdr-temps.service
+
+[Service]
+Type=simple
+User=jsn
+Environment=HOME=/home/jsn
+WorkingDirectory=/home/jsn/cc_projects/sdr
+
+ExecStart=python3 tg_temps.py
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
