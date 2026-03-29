@@ -1,7 +1,6 @@
 [Unit]
 Description=SDR Temperature Logger + Web Dashboard
 After=network.target
-# Don't block boot if SDR dongle is missing — temp_logger.py has its own 60s timeout
 
 [Service]
 Type=oneshot
@@ -10,14 +9,11 @@ User=jsn
 Environment=HOME=/home/jsn
 WorkingDirectory=/home/jsn/cc_projects/sdr
 
-ExecStart=/usr/bin/tmux new-session -d -s sdr -n logger \
-    "rtl_433 -F json -M time:iso 2>/dev/null | python3 temp_logger.py sdr" \; \
-    new-window -t sdr -n web \
-    "python3 web_temps.py --dir sdr"
+ExecStart=/usr/bin/tmux new-session -d -s sdr \
+    "rtl_433 -F json -M time:iso 2>/dev/null | python3 temp_server.py --dir sdr"
 
 ExecStop=/usr/bin/tmux kill-session -t sdr
 
-# Don't hold up boot
 TimeoutStartSec=30
 TimeoutStopSec=15
 

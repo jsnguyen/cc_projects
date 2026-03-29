@@ -28,8 +28,7 @@
         owner: jsn
         mode: "0755"
       loop:
-        - temp_logger.py
-        - web_temps.py
+        - temp_server.py
         - read_temps.py
         - start_logger.sh
 

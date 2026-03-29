@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
-"""Real-time temperature dashboard served over HTTP with SSE updates.
+"""SDR temperature logger + real-time web dashboard in a single process.
 
 Usage:
-    python sdr/web_temps.py [--port 8433] [--dir sdr/sdr]
+    rtl_433 -F json -M time:iso | python sdr/temp_server.py [--port 8433] [--dir sdr/sdr]
 
-Serves a live chart of the last 24 hours from .npz chunk files.
-Browser connects to / for the page and /stream for Server-Sent Events.
+Reads 433 MHz sensor JSON from stdin, stores weekly .npz chunks (8 GB cap),
+and serves a live dashboard with SSE updates on the specified port.
+
+Endpoints:
+    GET /       — D3.js dashboard (last 24 hours)
+    GET /temps  — JSON of latest readings per sensor
+    GET /stream — Server-Sent Events for real-time updates
 """
 
 import argparse
 import json
+import select
+import signal
 import sys
-import time
 import threading
+import time
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
 from pathlib import Path
+from socketserver import ThreadingMixIn
 
 import numpy as np
 
-DATA_DIR = Path("sdr/sdr")
-POLL_INTERVAL = 10  # seconds between npz re-reads
+# --- Config ---
+
+MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
+SAVE_INTERVAL = 60  # seconds between disk flushes
+STARTUP_TIMEOUT = 60  # seconds to wait for first stdin data
+SSE_TIMEOUT = 300  # drop idle SSE connections after 5 minutes
 
 CHANNEL_NAMES = {
     "0": "Bedroom",
@@ -29,94 +40,211 @@ CHANNEL_NAMES = {
     "3": "Garage",
 }
 
+# --- Shared state ---
 
-def find_chunks(data_dir: Path) -> list[Path]:
-    chunks = sorted(data_dir.glob("temp_log_????????_????????.npz"))
-    if not chunks and (data_dir / "temp_log.npz").exists():
-        chunks = [data_dir / "temp_log.npz"]
-    return chunks
+_lock = threading.Lock()
+_sensors: dict[str, dict] = {}  # {safe_key: {time: ndarray, temp_f: ndarray, humidity: ndarray}}
+_version = 0
+_out_dir = Path("sdr/sdr")
+_week_start = datetime.min
+_week_end = datetime.min
 
 
-def load_last_24h(data_dir: Path) -> dict:
-    """Load sensor data from the last 24 hours across all chunks."""
-    cutoff = datetime.now() - timedelta(hours=24)
-    cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+# --- Numpy storage helpers ---
 
-    result = {}
-    for chunk_path in find_chunks(data_dir):
-        npz = np.load(chunk_path)
-        keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
-        for key in keys:
-            times = npz[f"{key}_time"]
-            temps = npz[f"{key}_temp_f"]
-            humids = npz[f"{key}_humidity"]
-            # Filter to last 24h
-            mask = times >= cutoff_str
-            if not mask.any():
-                continue
-            t = times[mask]
-            tf = temps[mask]
-            h = humids[mask]
-            records = [
-                {"time": str(ti), "temp_f": round(float(tfi), 2),
-                 "humidity": round(float(hi), 1)}
-                for ti, tfi, hi in zip(t, tf, h)
-            ]
-            result.setdefault(key, []).extend(records)
-    return result
+def c_to_f(c: float) -> float:
+    return c * 9.0 / 5.0 + 32.0
 
+
+def week_bounds(dt: datetime) -> tuple[datetime, datetime]:
+    monday = dt - timedelta(days=dt.weekday())
+    start = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=7)
+
+
+def chunk_path(out_dir: Path, start: datetime, end: datetime) -> Path:
+    s = start.strftime("%Y%m%d")
+    e = end.strftime("%Y%m%d")
+    return out_dir / f"temp_log_{s}_{e}.npz"
+
+
+def find_chunks(out_dir: Path) -> list[Path]:
+    return sorted(out_dir.glob("temp_log_????????_????????.npz"))
+
+
+def total_chunk_size(out_dir: Path) -> int:
+    return sum(p.stat().st_size for p in find_chunks(out_dir))
+
+
+def enforce_cap(out_dir: Path):
+    while total_chunk_size(out_dir) > MAX_TOTAL_BYTES:
+        oldest = find_chunks(out_dir)
+        if not oldest:
+            break
+        oldest[0].unlink()
+        print(f"[cap] deleted {oldest[0].name}")
+
+
+def load_sensors(npz_path: Path) -> dict[str, dict]:
+    sensors: dict[str, dict] = {}
+    if not npz_path.exists():
+        return sensors
+    npz = np.load(npz_path)
+    keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
+    for key in keys:
+        sensors[key] = {
+            "time": npz[f"{key}_time"],
+            "temp_f": npz[f"{key}_temp_f"],
+            "humidity": npz[f"{key}_humidity"],
+        }
+    return sensors
+
+
+def save_sensors():
+    with _lock:
+        sensors = {k: {f: v.copy() for f, v in arrs.items()} for k, arrs in _sensors.items()}
+    npz_path = chunk_path(_out_dir, _week_start, _week_end)
+    npz_data = {}
+    for key, arrs in sensors.items():
+        npz_data[f"{key}_time"] = arrs["time"]
+        npz_data[f"{key}_temp_f"] = arrs["temp_f"]
+        npz_data[f"{key}_humidity"] = arrs["humidity"]
+    if npz_data:
+        np.savez_compressed(npz_path, **npz_data)
+        total = sum(len(a["time"]) for a in sensors.values())
+        print(f"[save] {total} records -> {npz_path.name}")
+
+
+def append_record(sensor_key: str, time_str: str, temp_f: float, humidity: float):
+    safe = sensor_key.replace(" ", "_")
+    with _lock:
+        if safe not in _sensors:
+            _sensors[safe] = {
+                "time": np.array([], dtype="U25"),
+                "temp_f": np.array([], dtype=np.float32),
+                "humidity": np.array([], dtype=np.float32),
+            }
+        s = _sensors[safe]
+        s["time"] = np.append(s["time"], time_str)
+        s["temp_f"] = np.append(s["temp_f"], np.float32(temp_f))
+        s["humidity"] = np.append(s["humidity"], np.float32(humidity))
+
+
+# --- Data access ---
 
 def channel_name(sensor_key: str) -> str:
-    """Map sensor key like 'Oregon_ch1' to friendly name."""
     parts = sensor_key.split("_ch")
     ch = parts[1] if len(parts) > 1 else sensor_key
     return CHANNEL_NAMES.get(ch, f"Channel {ch}")
 
 
 def get_latest_temps() -> dict:
-    """Return latest reading per sensor from current data."""
-    with _data_lock:
-        data = _current_data
+    with _lock:
+        sensors = _sensors
     result = {}
-    for key, records in sorted(data.items()):
-        if not records:
+    for key in sorted(sensors):
+        arrs = sensors[key]
+        if len(arrs["time"]) == 0:
             continue
-        last = records[-1]
-        name = channel_name(key)
-        result[name] = {
-            "temp_f": last["temp_f"],
-            "humidity": last["humidity"],
-            "time": last["time"],
+        result[channel_name(key)] = {
+            "temp_f": round(float(arrs["temp_f"][-1]), 2),
+            "humidity": round(float(arrs["humidity"][-1]), 1),
+            "time": str(arrs["time"][-1]),
         }
     return result
 
 
-# Shared state for SSE clients
-_data_lock = threading.Lock()
-_current_data = {}
-_data_version = 0
+def get_last_24h() -> dict:
+    cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+    with _lock:
+        snapshot = {k: {f: v.copy() for f, v in arrs.items()} for k, arrs in _sensors.items()}
+    result = {}
+    for key, arrs in sorted(snapshot.items()):
+        mask = arrs["time"] >= cutoff
+        if not mask.any():
+            continue
+        result[key] = [
+            {"time": str(t), "temp_f": round(float(tf), 2), "humidity": round(float(h), 1)}
+            for t, tf, h in zip(arrs["time"][mask], arrs["temp_f"][mask], arrs["humidity"][mask])
+        ]
+    return result
 
 
-def poll_data():
-    """Background thread that re-reads npz files periodically."""
-    global _current_data, _data_version
-    while True:
+# --- Stdin reader thread ---
+
+def stdin_reader():
+    global _version, _sensors, _week_start, _week_end
+
+    seen: dict[str, tuple[str, float]] = {}
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            data = load_last_24h(DATA_DIR)
-            with _data_lock:
-                _current_data = data
-                _data_version += 1
-            # Print latest readings
-            latest = get_latest_temps()
-            if latest:
-                ts = datetime.now().strftime("%H:%M:%S")
-                parts = [f"{name}: {v['temp_f']:.1f}°F {v['humidity']:.0f}%"
-                         for name, v in sorted(latest.items())]
-                print(f"[{ts}]  {'  |  '.join(parts)}")
-        except Exception as e:
-            print(f"[poll] error: {e}", file=sys.stderr)
-        time.sleep(POLL_INTERVAL)
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
+        temp_c = msg.get("temperature_C")
+        if temp_c is None:
+            continue
+
+        model = msg.get("model", "unknown")
+        channel = msg.get("channel", "?")
+        sensor_key = f"{model}_ch{channel}"
+        time_str = msg.get("time", datetime.now().isoformat())
+        humidity = msg.get("humidity", float("nan"))
+
+        # Deduplicate
+        dedup = (time_str[:19], temp_c)
+        if seen.get(sensor_key) == dedup:
+            continue
+        seen[sensor_key] = dedup
+
+        # Check week boundary
+        try:
+            msg_dt = datetime.fromisoformat(time_str)
+        except ValueError:
+            msg_dt = datetime.now()
+
+        if msg_dt >= _week_end:
+            save_sensors()
+            enforce_cap(_out_dir)
+            _week_start, _week_end = week_bounds(msg_dt)
+            with _lock:
+                _sensors = load_sensors(chunk_path(_out_dir, _week_start, _week_end))
+            print(f"[rotate] new chunk: {chunk_path(_out_dir, _week_start, _week_end).name}")
+
+        temp_f = round(c_to_f(temp_c), 2)
+        append_record(sensor_key, time_str, temp_f, humidity)
+
+        with _lock:
+            _version += 1
+
+        # Log line
+        latest = get_latest_temps()
+        ts = time_str[11:19] if len(time_str) >= 19 else time_str
+        parts = [f"{name}: {v['temp_f']:.1f}°F {v['humidity']:.0f}%"
+                 for name, v in sorted(latest.items())]
+        print(f"[{ts}]  {'  |  '.join(parts)}")
+
+    # EOF — final save
+    save_sensors()
+
+
+# --- Save thread ---
+
+def save_loop():
+    while True:
+        time.sleep(SAVE_INTERVAL)
+        try:
+            save_sensors()
+        except Exception as e:
+            print(f"[save] error: {e}", file=sys.stderr)
+
+
+# --- HTML dashboard ---
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -157,8 +285,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 var COLORS = ["#ff6b6b", "#48dbfb", "#feca57", "#a29bfe", "#fd79a8", "#55efc4"];
 var CHANNEL_NAMES = {"0": "Bedroom", "1": "Living Room", "3": "Garage"};
-var channels = {};
-var channelOrder = [];
 
 var margin = { top: 20, right: 30, bottom: 50, left: 62 };
 var W, H, w, h, svg, g, x, y, xAxisG, yAxisG, tip;
@@ -175,13 +301,10 @@ function initChart() {
   x = d3.scaleTime().range([0, w]);
   y = d3.scaleLinear().range([h, 0]);
 
-  // Grid
   g.append("g").attr("class", "grid");
-
   xAxisG = g.append("g").attr("transform", "translate(0," + h + ")");
   yAxisG = g.append("g");
 
-  // Axis labels
   g.append("text").attr("x", w / 2).attr("y", h + 42).attr("text-anchor", "middle")
     .attr("fill", "#99aabc").attr("font-size", 12).text("Time");
   g.append("text").attr("transform", "rotate(-90)").attr("x", -h / 2).attr("y", -46)
@@ -191,13 +314,18 @@ function initChart() {
   tip = d3.select("#tip");
 }
 
+function chName(key) {
+  var parts = key.split("_ch");
+  var chNum = parts.length > 1 ? parts[1] : key;
+  return CHANNEL_NAMES[chNum] || ("Channel " + chNum);
+}
+
 function updateChart(data) {
   var keys = Object.keys(data).sort();
-  channelOrder = keys;
 
   var allPoints = [];
   var series = {};
-  keys.forEach(function(key, i) {
+  keys.forEach(function(key) {
     var pts = data[key].map(function(r) {
       return { time: new Date(r.time), temp: r.temp_f, humidity: r.humidity, key: key };
     });
@@ -214,7 +342,6 @@ function updateChart(data) {
   var temps = allPoints.map(function(d) { return d.temp; });
   y.domain([d3.min(temps) - 1, d3.max(temps) + 1]).nice();
 
-  // Grid lines
   var gridSel = g.select(".grid").selectAll("line").data(y.ticks(8));
   gridSel.enter().append("line").merge(gridSel)
     .attr("x1", 0).attr("x2", w)
@@ -223,15 +350,12 @@ function updateChart(data) {
     .attr("stroke", "#2a2a4a").attr("stroke-dasharray", "2,4");
   gridSel.exit().remove();
 
-  // X axis
   xAxisG.call(d3.axisBottom(x).ticks(8).tickFormat(d3.timeFormat("%H:%M")))
     .selectAll("text,line,path").attr("stroke", "#556").attr("fill", "#889");
 
-  // Y axis
   yAxisG.call(d3.axisLeft(y).ticks(8).tickFormat(function(d) { return d + "\u00b0F"; }))
     .selectAll("text,line,path").attr("stroke", "#556").attr("fill", "#889");
 
-  // Lines
   var line = d3.line()
     .x(function(d) { return x(d.time); })
     .y(function(d) { return y(d.temp); })
@@ -244,18 +368,14 @@ function updateChart(data) {
       .attr("fill", "none").attr("stroke", color).attr("stroke-width", 2)
       .merge(sel).attr("d", line);
 
-    // Hover dots (sparse)
     var sparse = series[key].filter(function(_, j) { return j % 5 === 0; });
     var dots = g.selectAll(".dot-" + i).data(sparse);
     dots.enter().append("circle").attr("class", "dot-" + i)
       .attr("r", 3).attr("fill", color).attr("opacity", 0)
       .on("mouseover", function(ev, d) {
         d3.select(this).attr("opacity", 1).attr("r", 5).attr("stroke", "#fff").attr("stroke-width", 1);
-        var label = key.split("_ch");
-        var chNum = label.length > 1 ? label[1] : key;
-        var chName = CHANNEL_NAMES[chNum] || ("Channel " + chNum);
         tip.style("display", "block").html(
-          "<strong>" + chName + "</strong><br>" +
+          "<strong>" + chName(d.key) + "</strong><br>" +
           d.temp.toFixed(1) + "\u00b0F, " + d.humidity.toFixed(0) + "% humidity<br>" +
           d.time.toLocaleTimeString()
         );
@@ -273,7 +393,6 @@ function updateChart(data) {
     dots.exit().remove();
   });
 
-  // Update current reading cards
   updateCurrent(data, keys);
 }
 
@@ -285,13 +404,11 @@ function updateCurrent(data, keys) {
     var records = data[key];
     if (!records || records.length === 0) return;
     var last = records[records.length - 1];
-    var label = key.split("_ch");
-    var chNum = label.length > 1 ? label[1] : key;
-    var ch = CHANNEL_NAMES[chNum] || ("Channel " + chNum);
+    var name = chName(key);
     var color = COLORS[i % COLORS.length];
 
     var card = container.append("div").attr("class", "sensor-card");
-    card.append("div").attr("class", "label").text(ch);
+    card.append("div").attr("class", "label").text(name);
     card.append("div").attr("class", "temp").style("color", color)
       .text(last.temp_f.toFixed(1) + "\u00b0F");
     var hum = isNaN(last.humidity) ? "n/a" : last.humidity.toFixed(0) + "% humidity";
@@ -303,7 +420,6 @@ function updateCurrent(data, keys) {
 
 initChart();
 
-// SSE connection
 var statusEl = document.getElementById("status");
 function connect() {
   var es = new EventSource("/stream");
@@ -328,11 +444,10 @@ connect();
 </html>"""
 
 
-SSE_TIMEOUT = 300  # drop idle SSE connections after 5 minutes
-
+# --- HTTP handler ---
 
 class Handler(BaseHTTPRequestHandler):
-    timeout = 30  # socket timeout for regular requests
+    timeout = 30
 
     def do_GET(self):
         if self.path == "/":
@@ -353,21 +468,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            last_version = -1
+            last_ver = -1
             deadline = time.monotonic() + SSE_TIMEOUT
             try:
                 while time.monotonic() < deadline:
-                    with _data_lock:
-                        version = _data_version
-                        data = _current_data
-                    if version != last_version:
+                    with _lock:
+                        ver = _version
+                    if ver != last_ver:
+                        data = get_last_24h()
                         payload = json.dumps(data, separators=(",", ":"))
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
-                        last_version = version
-                        deadline = time.monotonic() + SSE_TIMEOUT  # reset on activity
+                        last_ver = ver
+                        deadline = time.monotonic() + SSE_TIMEOUT
                     time.sleep(1)
-                # Send a comment so the client reconnects cleanly
                 self.wfile.write(b": timeout\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -376,44 +490,63 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def log_message(self, format, *args):
-        # Quiet unless error
         if args and str(args[0]).startswith("4"):
             super().log_message(format, *args)
 
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+# --- Main ---
+
 def main():
-    global DATA_DIR
-    parser = argparse.ArgumentParser(description="Temperature web dashboard")
+    global _sensors, _version, _week_start, _week_end, _out_dir
+
+    parser = argparse.ArgumentParser(description="SDR temperature server")
     parser.add_argument("--port", type=int, default=8433)
-    parser.add_argument("--dir", default="sdr/sdr",
-                        help="Directory with .npz chunks")
+    parser.add_argument("--dir", default="sdr/sdr", help="Directory for .npz chunks")
     args = parser.parse_args()
-    DATA_DIR = Path(args.dir)
 
-    # Initial load
-    data = load_last_24h(DATA_DIR)
-    with _data_lock:
-        global _current_data, _data_version
-        _current_data = data
-        _data_version = 1
+    _out_dir = Path(args.dir)
+    _out_dir.mkdir(parents=True, exist_ok=True)
 
-    n = sum(len(v) for v in data.values())
-    print(f"Loaded {n} records from {len(find_chunks(DATA_DIR))} chunk(s)")
+    # Load current week's data
+    now = datetime.now()
+    _week_start, _week_end = week_bounds(now)
+    npz = chunk_path(_out_dir, _week_start, _week_end)
+    _sensors = load_sensors(npz)
+
+    n = sum(len(a["time"]) for a in _sensors.values())
+    used = total_chunk_size(_out_dir)
+    n_chunks = len(find_chunks(_out_dir))
+    print(f"Loaded {n} records from {npz.name}")
+    print(f"Storage: {used / 1e6:.1f} MB across {n_chunks} chunk(s), cap {MAX_TOTAL_BYTES / 1e9:.0f} GB")
+    _version = 1 if _sensors else 0
+
+    # Wait for stdin with timeout
+    print(f"Waiting for sensor data on stdin (timeout {STARTUP_TIMEOUT}s)...")
+    ready, _, _ = select.select([sys.stdin], [], [], STARTUP_TIMEOUT)
+    if not ready:
+        print(f"No data after {STARTUP_TIMEOUT}s — running web-only mode.")
+
+    # Start background threads
+    threading.Thread(target=stdin_reader, daemon=True).start()
+    threading.Thread(target=save_loop, daemon=True).start()
+
+    # Signal handler for clean shutdown
+    def shutdown(sig, frame):
+        print("\nShutting down...")
+        save_sensors()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    # Start HTTP server on main thread
     print(f"Serving on http://0.0.0.0:{args.port}")
-
-    # Start background poller
-    t = threading.Thread(target=poll_data, daemon=True)
-    t.start()
-
-    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-        daemon_threads = True
-
     server = ThreadedHTTPServer(("0.0.0.0", args.port), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-        server.shutdown()
+    server.serve_forever()
 
 
 if __name__ == "__main__":
