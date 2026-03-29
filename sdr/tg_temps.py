@@ -2,20 +2,36 @@
 """Telegram bot that reports latest temperatures from the SDR server.
 
 Usage:
-    TELEGRAM_BOT_TOKEN=xxx TELEGRAM_USER_ID=123 python sdr/tg_temps.py [--url http://localhost:8433]
+    python sdr/tg_temps.py [--url http://localhost:8433]
+
+Config: ~/.sdr_tg.json with bot_token, user_id, server_url
+Or env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID, SDR_SERVER_URL
 
 Commands:
     /temps  — latest readings from all sensors
     /start  — same as /temps
 """
 
+import argparse
 import json
+import logging
 import os
 import sys
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+log = logging.getLogger("tg_temps")
 
 CONFIG_PATH = Path.home() / ".sdr_tg.json"
 
@@ -24,8 +40,11 @@ def load_config() -> dict:
     """Load config from ~/.sdr_tg.json, fall back to env vars."""
     config = {}
     if CONFIG_PATH.exists():
+        log.info("loading config from %s", CONFIG_PATH)
         with open(CONFIG_PATH) as f:
             config = json.load(f)
+    else:
+        log.info("no config file at %s, using env vars", CONFIG_PATH)
     return {
         "bot_token": config.get("bot_token", os.environ.get("TELEGRAM_BOT_TOKEN", "")),
         "user_id": int(config.get("user_id", os.environ.get("TELEGRAM_USER_ID", "0"))),
@@ -53,13 +72,16 @@ def tg_request(method: str, params: dict | None = None) -> dict:
 
 
 def fetch_temps() -> str:
+    log.info("fetching temps from %s/temps", SERVER_URL)
     try:
         with urllib.request.urlopen(f"{SERVER_URL}/temps", timeout=5) as resp:
             data = json.loads(resp.read())
     except Exception as e:
+        log.error("failed to fetch temps: %s", e)
         return f"Error fetching temps: {e}"
 
     if not data:
+        log.warning("no sensor data returned")
         return "No sensor data available."
 
     lines = []
@@ -74,74 +96,83 @@ def fetch_temps() -> str:
 def handle_update(update: dict):
     msg = update.get("message")
     if not msg:
+        log.debug("non-message update: %s", update.get("update_id"))
         return
 
     user_id = msg.get("from", {}).get("id", 0)
-    if ALLOWED_USER and user_id != ALLOWED_USER:
-        return
-
+    username = msg.get("from", {}).get("username", str(user_id))
     text = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
 
+    log.info("message from %s (id=%d): %s", username, user_id, text)
+
+    if ALLOWED_USER and user_id != ALLOWED_USER:
+        log.warning("rejected message from unauthorized user %s (id=%d)", username, user_id)
+        return
+
     if text in ("/temps", "/start", "/temp", "/t"):
         reply = fetch_temps()
+        log.info("sending reply to %s (%d chars)", username, len(reply))
         tg_request("sendMessage", {
             "chat_id": chat_id,
             "text": reply,
             "parse_mode": "Markdown",
         })
+    else:
+        log.info("ignoring unrecognized command: %s", text)
 
 
 def main():
     global SERVER_URL
 
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=SERVER_URL)
     args = parser.parse_args()
     SERVER_URL = args.url
 
     if not BOT_TOKEN:
-        print(f"No bot token. Set in {CONFIG_PATH} or TELEGRAM_BOT_TOKEN env var.",
-              file=sys.stderr)
+        log.error("no bot token. set in %s or TELEGRAM_BOT_TOKEN env var", CONFIG_PATH)
         sys.exit(1)
     if not ALLOWED_USER:
-        print(f"No user ID. Set in {CONFIG_PATH} or TELEGRAM_USER_ID env var.",
-              file=sys.stderr)
+        log.error("no user ID. set in %s or TELEGRAM_USER_ID env var", CONFIG_PATH)
         sys.exit(1)
+
+    log.info("config: user_id=%d, server=%s", ALLOWED_USER, SERVER_URL)
+    log.info("bot token: %s...%s", BOT_TOKEN[:8], BOT_TOKEN[-4:])
 
     # Verify token on startup
     try:
         me = tg_request("getMe")
         bot_name = me.get("result", {}).get("username", "unknown")
-        print(f"Bot @{bot_name} started (user_id={ALLOWED_USER}, server={SERVER_URL})")
+        log.info("connected to Telegram as @%s", bot_name)
     except Exception as e:
-        print(f"ERROR: could not connect to Telegram API: {e}", file=sys.stderr)
-        print(f"Check your bot token in {CONFIG_PATH}", file=sys.stderr)
+        log.error("failed to connect to Telegram API: %s", e)
+        log.error("check bot token in %s", CONFIG_PATH)
         sys.exit(1)
 
+    log.info("polling for updates (timeout=%ds)...", POLL_TIMEOUT)
     offset = 0
+    poll_count = 0
     while True:
         try:
             result = tg_request("getUpdates", {
                 "offset": offset,
                 "timeout": POLL_TIMEOUT,
             })
+            poll_count += 1
             updates = result.get("result", [])
             if updates:
-                print(f"[tg] received {len(updates)} update(s)")
+                log.info("received %d update(s)", len(updates))
+            elif poll_count % 10 == 0:
+                log.debug("poll #%d: no updates (still alive)", poll_count)
             for update in updates:
                 offset = update["update_id"] + 1
-                msg = update.get("message", {})
-                user = msg.get("from", {})
-                text = msg.get("text", "")
-                print(f"[tg] {user.get('username', user.get('id', '?'))}: {text}")
                 handle_update(update)
         except urllib.error.URLError as e:
-            print(f"[tg] poll error: {e}", file=sys.stderr)
+            log.error("poll error: %s", e)
             time.sleep(5)
         except Exception as e:
-            print(f"[tg] error: {e}", file=sys.stderr)
+            log.error("unexpected error: %s", e, exc_info=True)
             time.sleep(5)
 
 

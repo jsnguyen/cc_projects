@@ -15,6 +15,7 @@ Endpoints:
 
 import argparse
 import json
+import logging
 import signal
 import sys
 import threading
@@ -25,6 +26,18 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 
 import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+# Force unbuffered so journald sees output immediately
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+log = logging.getLogger("temp_server")
 
 # --- Config ---
 
@@ -81,14 +94,19 @@ def enforce_cap(out_dir: Path):
         if not oldest:
             break
         oldest[0].unlink()
-        print(f"[cap] deleted {oldest[0].name}")
+        log.info("cap: deleted %s", oldest[0].name)
 
 
 def load_sensors(npz_path: Path) -> dict[str, dict]:
     sensors: dict[str, dict] = {}
     if not npz_path.exists():
+        log.info("no existing chunk at %s", npz_path.name)
         return sensors
-    npz = np.load(npz_path)
+    try:
+        npz = np.load(npz_path)
+    except Exception as e:
+        log.error("failed to load %s: %s — starting fresh", npz_path.name, e)
+        return sensors
     keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
     for key in keys:
         sensors[key] = {
@@ -96,6 +114,7 @@ def load_sensors(npz_path: Path) -> dict[str, dict]:
             "temp_f": npz[f"{key}_temp_f"],
             "humidity": npz[f"{key}_humidity"],
         }
+    log.info("loaded %d sensors from %s", len(keys), npz_path.name)
     return sensors
 
 
@@ -111,7 +130,7 @@ def save_sensors():
     if npz_data:
         np.savez_compressed(npz_path, **npz_data)
         total = sum(len(a["time"]) for a in sensors.values())
-        print(f"[save] {total} records -> {npz_path.name}")
+        log.info("save: %d records -> %s", total, npz_path.name)
 
 
 def append_record(sensor_key: str, time_str: str, temp_f: float, humidity: float):
@@ -174,19 +193,31 @@ def get_last_24h() -> dict:
 def stdin_reader():
     global _version, _sensors, _week_start, _week_end
 
+    log.info("stdin reader started, waiting for data...")
     seen: dict[str, tuple[str, float]] = {}
+    line_count = 0
 
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
+
+        line_count += 1
+        if line_count == 1:
+            log.info("first stdin line received")
+        if line_count <= 3:
+            log.debug("stdin raw: %s", line[:200])
+
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
+            log.warning("invalid JSON on stdin: %s", line[:100])
             continue
 
         temp_c = msg.get("temperature_C")
         if temp_c is None:
+            if line_count <= 5:
+                log.debug("non-temp message: model=%s", msg.get("model", "?"))
             continue
 
         model = msg.get("model", "unknown")
@@ -213,7 +244,7 @@ def stdin_reader():
             _week_start, _week_end = week_bounds(msg_dt)
             with _lock:
                 _sensors = load_sensors(chunk_path(_out_dir, _week_start, _week_end))
-            print(f"[rotate] new chunk: {chunk_path(_out_dir, _week_start, _week_end).name}")
+            log.info("rotate: new chunk %s", chunk_path(_out_dir, _week_start, _week_end).name)
 
         temp_f = round(c_to_f(temp_c), 2)
         append_record(sensor_key, time_str, temp_f, humidity)
@@ -221,14 +252,14 @@ def stdin_reader():
         with _lock:
             _version += 1
 
-        # Log line
+        # Log latest readings
         latest = get_latest_temps()
         ts = time_str[11:19] if len(time_str) >= 19 else time_str
         parts = [f"{name}: {v['temp_f']:.1f}°F {v['humidity']:.0f}%"
                  for name, v in sorted(latest.items())]
-        print(f"[{ts}]  {'  |  '.join(parts)}")
+        log.info("%s  %s", ts, "  |  ".join(parts))
 
-    # EOF — final save
+    log.warning("stdin EOF — no more data")
     save_sensors()
 
 
@@ -240,7 +271,7 @@ def save_loop():
         try:
             save_sensors()
         except Exception as e:
-            print(f"[save] error: {e}", file=sys.stderr)
+            log.error("save error: %s", e)
 
 
 # --- HTML dashboard ---
@@ -512,8 +543,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def log_message(self, format, *args):
-        if args and str(args[0]).startswith("4"):
-            super().log_message(format, *args)
+        if args and str(args[0]).startswith(("4", "5")):
+            log.warning("HTTP %s %s", args[0], args[1] if len(args) > 1 else "")
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -542,31 +573,30 @@ def main():
     n = sum(len(a["time"]) for a in _sensors.values())
     used = total_chunk_size(_out_dir)
     n_chunks = len(find_chunks(_out_dir))
-    print(f"Loaded {n} records from {npz.name}")
-    print(f"Storage: {used / 1e6:.1f} MB across {n_chunks} chunk(s), cap {MAX_TOTAL_BYTES / 1e9:.0f} GB")
+    log.info("loaded %d records from %s", n, npz.name)
+    log.info("storage: %.1f MB across %d chunk(s), cap %.0f GB",
+             used / 1e6, n_chunks, MAX_TOTAL_BYTES / 1e9)
     _version = 1 if _sensors else 0
 
-    print("Listening for sensor data on stdin...")
+    log.info("starting stdin reader thread...")
     threading.Thread(target=stdin_reader, daemon=True).start()
+    log.info("starting save loop thread (interval=%ds)...", SAVE_INTERVAL)
     threading.Thread(target=save_loop, daemon=True).start()
 
-    # Signal handler for clean shutdown — close stdin so rtl_433 gets
-    # SIGPIPE and releases the USB device, then save and exit
     def shutdown(sig, frame):
-        print("\nShutting down...")
+        log.info("shutdown signal received (sig=%d)", sig)
         try:
             sys.stdin.close()
         except Exception:
             pass
         save_sensors()
-        print("Saved. Device released.")
+        log.info("saved. device released. exiting.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Start HTTP server on main thread
-    print(f"Serving on http://0.0.0.0:{args.port}")
+    log.info("serving on http://0.0.0.0:%d", args.port)
     server = ThreadedHTTPServer(("0.0.0.0", args.port), Handler)
     server.serve_forever()
 
