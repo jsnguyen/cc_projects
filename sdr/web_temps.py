@@ -23,6 +23,12 @@ import numpy as np
 DATA_DIR = Path("sdr/sdr")
 POLL_INTERVAL = 10  # seconds between npz re-reads
 
+CHANNEL_NAMES = {
+    "0": "Bedroom",
+    "1": "Living Room",
+    "3": "Garage",
+}
+
 
 def find_chunks(data_dir: Path) -> list[Path]:
     chunks = sorted(data_dir.glob("temp_log_????????_????????.npz"))
@@ -60,6 +66,31 @@ def load_last_24h(data_dir: Path) -> dict:
     return result
 
 
+def channel_name(sensor_key: str) -> str:
+    """Map sensor key like 'Oregon_ch1' to friendly name."""
+    parts = sensor_key.split("_ch")
+    ch = parts[1] if len(parts) > 1 else sensor_key
+    return CHANNEL_NAMES.get(ch, f"Channel {ch}")
+
+
+def get_latest_temps() -> dict:
+    """Return latest reading per sensor from current data."""
+    with _data_lock:
+        data = _current_data
+    result = {}
+    for key, records in sorted(data.items()):
+        if not records:
+            continue
+        last = records[-1]
+        name = channel_name(key)
+        result[name] = {
+            "temp_f": last["temp_f"],
+            "humidity": last["humidity"],
+            "time": last["time"],
+        }
+    return result
+
+
 # Shared state for SSE clients
 _data_lock = threading.Lock()
 _current_data = {}
@@ -75,6 +106,13 @@ def poll_data():
             with _data_lock:
                 _current_data = data
                 _data_version += 1
+            # Print latest readings
+            latest = get_latest_temps()
+            if latest:
+                ts = datetime.now().strftime("%H:%M:%S")
+                parts = [f"{name}: {v['temp_f']:.1f}°F {v['humidity']:.0f}%"
+                         for name, v in sorted(latest.items())]
+                print(f"[{ts}]  {'  |  '.join(parts)}")
         except Exception as e:
             print(f"[poll] error: {e}", file=sys.stderr)
         time.sleep(POLL_INTERVAL)
@@ -118,6 +156,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
 var COLORS = ["#ff6b6b", "#48dbfb", "#feca57", "#a29bfe", "#fd79a8", "#55efc4"];
+var CHANNEL_NAMES = {"0": "Bedroom", "1": "Living Room", "3": "Garage"};
 var channels = {};
 var channelOrder = [];
 
@@ -213,9 +252,10 @@ function updateChart(data) {
       .on("mouseover", function(ev, d) {
         d3.select(this).attr("opacity", 1).attr("r", 5).attr("stroke", "#fff").attr("stroke-width", 1);
         var label = key.split("_ch");
-        var ch = label.length > 1 ? "ch" + label[1] : key;
+        var chNum = label.length > 1 ? label[1] : key;
+        var chName = CHANNEL_NAMES[chNum] || ("Channel " + chNum);
         tip.style("display", "block").html(
-          "<strong>" + ch + "</strong><br>" +
+          "<strong>" + chName + "</strong><br>" +
           d.temp.toFixed(1) + "\u00b0F, " + d.humidity.toFixed(0) + "% humidity<br>" +
           d.time.toLocaleTimeString()
         );
@@ -246,7 +286,8 @@ function updateCurrent(data, keys) {
     if (!records || records.length === 0) return;
     var last = records[records.length - 1];
     var label = key.split("_ch");
-    var ch = label.length > 1 ? "Channel " + label[1] : key;
+    var chNum = label.length > 1 ? label[1] : key;
+    var ch = CHANNEL_NAMES[chNum] || ("Channel " + chNum);
     var color = COLORS[i % COLORS.length];
 
     var card = container.append("div").attr("class", "sensor-card");
@@ -299,6 +340,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode())
+        elif self.path == "/temps":
+            payload = json.dumps(get_latest_temps(), indent=2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(payload.encode())
         elif self.path == "/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
