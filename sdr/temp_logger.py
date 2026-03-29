@@ -11,6 +11,7 @@ Old chunks are deleted when total size exceeds MAX_TOTAL_BYTES (default 8 GB).
 """
 
 import json
+import select
 import sys
 import signal
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
+STARTUP_TIMEOUT = 60  # seconds to wait for first data before exiting
 
 PLOT_WIDTH = 60
 PLOT_HEIGHT = 12
@@ -238,7 +240,16 @@ def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
     sys.stderr.write(HIDE_CURSOR)
-    print("Waiting for sensor data on stdin...", file=sys.stderr)
+    print(f"Waiting for sensor data on stdin (timeout {STARTUP_TIMEOUT}s)...",
+          file=sys.stderr)
+
+    # Wait for first data with a timeout so we don't block boot
+    ready, _, _ = select.select([sys.stdin], [], [], STARTUP_TIMEOUT)
+    if not ready:
+        cleanup()
+        print(f"No data received after {STARTUP_TIMEOUT}s — exiting. "
+              "Is the SDR dongle connected?", file=sys.stderr)
+        sys.exit(1)
 
     latest: dict[str, str] = {}
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=SDR Temperature Logger + Web Dashboard
+After=network.target
+# Don't block boot if SDR dongle is missing — temp_logger.py has its own 60s timeout
+
+[Service]
+Type=forking
+User=jsn
+Environment=HOME=/home/jsn
+WorkingDirectory=/home/jsn/landing/cc_projects
+
+ExecStart=/usr/bin/tmux new-session -d -s sdr -n logger \
+    "rtl_433 -F json -M time:iso 2>/dev/null | /home/jsn/landing/cc_projects/.venv/bin/python sdr/temp_logger.py sdr/sdr" \; \
+    new-window -t sdr -n web \
+    "/home/jsn/landing/cc_projects/.venv/bin/python sdr/web_temps.py --dir sdr/sdr"
+
+ExecStop=/usr/bin/tmux kill-session -t sdr
+
+# Don't hold up boot
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
