@@ -8,7 +8,7 @@ User=jsn
 Environment=HOME=/home/jsn
 WorkingDirectory=/home/jsn/cc_projects/sdr
 
-ExecStart=/bin/bash -c 'rtl_433 -F json -M time:iso 2>/dev/null | python3 temp_server.py --dir sdr'
+ExecStart=/bin/bash -c 'rtl_433 -F json -M time:iso 2>/dev/null | /home/jsn/.pyenv/versions/3.14.3/bin/python3 temp_server.py --dir sdr'
 
 TimeoutStartSec=30
 TimeoutStopSec=15

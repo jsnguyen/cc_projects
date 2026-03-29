@@ -8,7 +8,7 @@ User=jsn
 Environment=HOME=/home/jsn
 WorkingDirectory=/home/jsn/cc_projects/sdr
 
-ExecStart=python3 tg_temps.py
+ExecStart=/home/jsn/.pyenv/versions/3.14.3/bin/python3 tg_temps.py
 
 Restart=on-failure
 RestartSec=10
