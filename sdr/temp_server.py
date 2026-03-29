@@ -15,9 +15,7 @@ Endpoints:
 
 import argparse
 import json
-import os
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -27,47 +25,6 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 
 import numpy as np
-
-
-RTL_SDR_IDS = ["0bda:2838", "0bda:2832"]  # common RTL-SDR USB vendor:product
-
-
-def check_sdr_device():
-    """Check if RTL-SDR dongle is connected and release it if claimed by a stale process."""
-    # Check if device is present
-    try:
-        lsusb = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        print("[sdr] lsusb not available, skipping device check")
-        return True
-
-    found = any(vid in lsusb.stdout for vid in RTL_SDR_IDS)
-    if not found:
-        print("[sdr] WARNING: no RTL-SDR dongle detected")
-        return False
-
-    print("[sdr] RTL-SDR dongle detected")
-
-    # Kill stale rtl_ processes that might be holding the device
-    my_pid = os.getpid()
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "rtl_433|rtl_sdr|rtl_test|rtl_fm|rtl_power"],
-            capture_output=True, text=True, timeout=5
-        )
-        for pid_str in result.stdout.strip().split("\n"):
-            if not pid_str:
-                continue
-            pid = int(pid_str)
-            if pid != my_pid and pid != os.getppid():
-                print(f"[sdr] killing stale process {pid}")
-                os.kill(pid, signal.SIGTERM)
-        if result.stdout.strip():
-            time.sleep(1)  # let them release the device
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    return True
 
 # --- Config ---
 
@@ -468,6 +425,8 @@ function updateCurrent(data, keys) {
       .text(last.temp_f.toFixed(1) + "\u00b0F");
     var hum = isNaN(last.humidity) ? "n/a" : last.humidity.toFixed(0) + "% humidity";
     card.append("div").attr("class", "humid").text(hum);
+    var t = last.time.replace("T", " ").substring(0, 19);
+    card.append("div").attr("class", "time").text(t);
     card.append("div").attr("class", "ago").attr("data-time", last.time).text(timeAgo(last.time));
   });
 
@@ -587,17 +546,20 @@ def main():
     print(f"Storage: {used / 1e6:.1f} MB across {n_chunks} chunk(s), cap {MAX_TOTAL_BYTES / 1e9:.0f} GB")
     _version = 1 if _sensors else 0
 
-    # Check SDR device and release stale claims
-    check_sdr_device()
-
     print("Listening for sensor data on stdin...")
     threading.Thread(target=stdin_reader, daemon=True).start()
     threading.Thread(target=save_loop, daemon=True).start()
 
-    # Signal handler for clean shutdown
+    # Signal handler for clean shutdown — close stdin so rtl_433 gets
+    # SIGPIPE and releases the USB device, then save and exit
     def shutdown(sig, frame):
         print("\nShutting down...")
+        try:
+            sys.stdin.close()
+        except Exception:
+            pass
         save_sensors()
+        print("Saved. Device released.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
