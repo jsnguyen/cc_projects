@@ -15,8 +15,9 @@ Endpoints:
 
 import argparse
 import json
-import select
+import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -27,17 +28,58 @@ from socketserver import ThreadingMixIn
 
 import numpy as np
 
+
+RTL_SDR_IDS = ["0bda:2838", "0bda:2832"]  # common RTL-SDR USB vendor:product
+
+
+def check_sdr_device():
+    """Check if RTL-SDR dongle is connected and release it if claimed by a stale process."""
+    # Check if device is present
+    try:
+        lsusb = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        print("[sdr] lsusb not available, skipping device check")
+        return True
+
+    found = any(vid in lsusb.stdout for vid in RTL_SDR_IDS)
+    if not found:
+        print("[sdr] WARNING: no RTL-SDR dongle detected")
+        return False
+
+    print("[sdr] RTL-SDR dongle detected")
+
+    # Kill stale rtl_ processes that might be holding the device
+    my_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "rtl_433|rtl_sdr|rtl_test|rtl_fm|rtl_power"],
+            capture_output=True, text=True, timeout=5
+        )
+        for pid_str in result.stdout.strip().split("\n"):
+            if not pid_str:
+                continue
+            pid = int(pid_str)
+            if pid != my_pid and pid != os.getppid():
+                print(f"[sdr] killing stale process {pid}")
+                os.kill(pid, signal.SIGTERM)
+        if result.stdout.strip():
+            time.sleep(1)  # let them release the device
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return True
+
 # --- Config ---
 
 MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
 SAVE_INTERVAL = 60  # seconds between disk flushes
-STARTUP_TIMEOUT = 60  # seconds to wait for first stdin data
+STARTUP_TIMEOUT = 3000  # seconds to wait for first stdin data
 SSE_TIMEOUT = 300  # drop idle SSE connections after 5 minutes
 
 CHANNEL_NAMES = {
     "0": "Bedroom",
     "1": "Living Room",
-    "3": "Garage",
+    "2": "Garage",
 }
 
 # --- Shared state ---
@@ -266,6 +308,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .sensor-card .temp { font-size: 2em; font-weight: 600; }
   .sensor-card .humid { font-size: 0.85em; color: #778899; margin-top: 2px; }
   .sensor-card .time { font-size: 0.7em; color: #556; margin-top: 4px; }
+  .sensor-card .ago { font-size: 0.7em; color: #666; margin-top: 2px; }
   #chart { width: 100%; display: flex; justify-content: center; }
   .tooltip {
     position: absolute; pointer-events: none; background: rgba(10,10,30,0.95);
@@ -284,7 +327,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
 var COLORS = ["#ff6b6b", "#48dbfb", "#feca57", "#a29bfe", "#fd79a8", "#55efc4"];
-var CHANNEL_NAMES = {"0": "Bedroom", "1": "Living Room", "3": "Garage"};
+var CHANNEL_NAMES = {"0": "Bedroom", "1": "Living Room", "2": "Garage"};
 
 var margin = { top: 20, right: 30, bottom: 50, left: 62 };
 var W, H, w, h, svg, g, x, y, xAxisG, yAxisG, tip;
@@ -396,6 +439,18 @@ function updateChart(data) {
   updateCurrent(data, keys);
 }
 
+function timeAgo(dateStr) {
+  var then = new Date(dateStr);
+  var diff = Math.floor((Date.now() - then) / 1000);
+  if (diff < 5) return "just now";
+  if (diff < 60) return diff + "s ago";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
+}
+
+var _agoIntervalId = null;
+
 function updateCurrent(data, keys) {
   var container = d3.select("#current");
   container.selectAll("*").remove();
@@ -413,9 +468,17 @@ function updateCurrent(data, keys) {
       .text(last.temp_f.toFixed(1) + "\u00b0F");
     var hum = isNaN(last.humidity) ? "n/a" : last.humidity.toFixed(0) + "% humidity";
     card.append("div").attr("class", "humid").text(hum);
-    var t = last.time.replace("T", " ").substring(0, 19);
-    card.append("div").attr("class", "time").text(t);
+    card.append("div").attr("class", "ago").attr("data-time", last.time).text(timeAgo(last.time));
   });
+
+  // Tick the "ago" labels every 5 seconds
+  if (_agoIntervalId) clearInterval(_agoIntervalId);
+  _agoIntervalId = setInterval(function() {
+    d3.selectAll(".ago").each(function() {
+      var el = d3.select(this);
+      el.text(timeAgo(el.attr("data-time")));
+    });
+  }, 5000);
 }
 
 initChart();
@@ -524,13 +587,10 @@ def main():
     print(f"Storage: {used / 1e6:.1f} MB across {n_chunks} chunk(s), cap {MAX_TOTAL_BYTES / 1e9:.0f} GB")
     _version = 1 if _sensors else 0
 
-    # Wait for stdin with timeout
-    print(f"Waiting for sensor data on stdin (timeout {STARTUP_TIMEOUT}s)...")
-    ready, _, _ = select.select([sys.stdin], [], [], STARTUP_TIMEOUT)
-    if not ready:
-        print(f"No data after {STARTUP_TIMEOUT}s — running web-only mode.")
+    # Check SDR device and release stale claims
+    check_sdr_device()
 
-    # Start background threads
+    print("Listening for sensor data on stdin...")
     threading.Thread(target=stdin_reader, daemon=True).start()
     threading.Thread(target=save_loop, daemon=True).start()
 
