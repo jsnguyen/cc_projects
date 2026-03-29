@@ -15,6 +15,7 @@ import time
 import threading
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from pathlib import Path
 
 import numpy as np
@@ -286,7 +287,12 @@ connect();
 </html>"""
 
 
+SSE_TIMEOUT = 300  # drop idle SSE connections after 5 minutes
+
+
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30  # socket timeout for regular requests
+
     def do_GET(self):
         if self.path == "/":
             self.send_response(200)
@@ -301,8 +307,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             last_version = -1
+            deadline = time.monotonic() + SSE_TIMEOUT
             try:
-                while True:
+                while time.monotonic() < deadline:
                     with _data_lock:
                         version = _data_version
                         data = _current_data
@@ -311,8 +318,12 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
                         last_version = version
+                        deadline = time.monotonic() + SSE_TIMEOUT  # reset on activity
                     time.sleep(1)
-            except (BrokenPipeError, ConnectionResetError):
+                # Send a comment so the client reconnects cleanly
+                self.wfile.write(b": timeout\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
         else:
             self.send_error(404)
@@ -347,7 +358,10 @@ def main():
     t = threading.Thread(target=poll_data, daemon=True)
     t.start()
 
-    server = HTTPServer(("0.0.0.0", args.port), Handler)
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    server = ThreadedHTTPServer(("0.0.0.0", args.port), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

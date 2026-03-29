@@ -1,0 +1,58 @@
+---
+- name: Setup SDR temperature logger on romulus
+  hosts: romulus
+  become: true
+
+  tasks:
+    - name: Install packages
+      apt:
+        name:
+          - tmux
+          - rtl-433
+          - avahi-daemon
+          - python3
+          - python3-numpy
+        state: present
+        update_cache: true
+
+    - name: Enable mDNS
+      systemd:
+        name: avahi-daemon
+        enabled: true
+        state: started
+
+    - name: Copy SDR scripts
+      copy:
+        src: "{{ item }}"
+        dest: /home/jsn/cc_projects/sdr/
+        owner: jsn
+        mode: "0755"
+      loop:
+        - temp_logger.py
+        - web_temps.py
+        - read_temps.py
+        - start_logger.sh
+
+    - name: Create data directory
+      file:
+        path: /home/jsn/cc_projects/sdr/sdr
+        state: directory
+        owner: jsn
+
+    - name: Install systemd service
+      copy:
+        src: sdr-temps.service
+        dest: /etc/systemd/system/sdr-temps.service
+
+    - name: Enable and start service
+      systemd:
+        name: sdr-temps
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Allow port 8433
+      ufw:
+        rule: allow
+        port: "8433"
+        proto: tcp
