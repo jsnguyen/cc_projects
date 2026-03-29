@@ -4,7 +4,8 @@ After=network.target
 # Don't block boot if SDR dongle is missing — temp_logger.py has its own 60s timeout
 
 [Service]
-Type=forking
+Type=oneshot
+RemainAfterExit=yes
 User=jsn
 Environment=HOME=/home/jsn
 WorkingDirectory=/home/jsn/cc_projects/sdr
