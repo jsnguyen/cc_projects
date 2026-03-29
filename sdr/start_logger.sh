@@ -21,8 +21,9 @@ tmux new-session -d -s "$SESSION" -n server \
 
 # Window 1: Telegram bot (if config file or env var exists)
 if [ -n "$TELEGRAM_BOT_TOKEN" ] || [ -f "$HOME/.sdr_tg.json" ]; then
-    tmux new-window -t "$SESSION" -n tgbot \
-        "cd '$SCRIPT_DIR' && python3 tg_temps.py"
+    tmux new-window -t "$SESSION" -n tgbot
+    tmux set-option -t "$SESSION:tgbot" remain-on-exit on
+    tmux send-keys -t "$SESSION:tgbot" "cd '$SCRIPT_DIR' && python3 tg_temps.py" Enter
 fi
 
 tmux select-window -t "$SESSION:server"
