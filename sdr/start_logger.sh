@@ -26,8 +26,8 @@ tmux new-session -d -s "$SESSION" -n logger \
 tmux new-window -t "$SESSION" -n web \
     "cd '$PROJECT_DIR' && $PYTHON '$SCRIPT_DIR/web_temps.py' --dir '$OUT_DIR'"
 
-# Start on the web window so attach shows the URL
-tmux select-window -t "$SESSION:web"
+# Default to logger window on attach
+tmux select-window -t "$SESSION:logger"
 
 echo "Started sdr session with 2 windows:"
 echo "  logger: rtl_433 | temp_logger.py"
