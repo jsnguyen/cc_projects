@@ -7,12 +7,12 @@ After=network.target
 Type=forking
 User=jsn
 Environment=HOME=/home/jsn
-WorkingDirectory=/home/jsn/landing/cc_projects
+WorkingDirectory=/home/jsn/cc_projects/sdr
 
 ExecStart=/usr/bin/tmux new-session -d -s sdr -n logger \
-    "rtl_433 -F json -M time:iso 2>/dev/null | /home/jsn/landing/cc_projects/.venv/bin/python sdr/temp_logger.py sdr/sdr" \; \
+    "rtl_433 -F json -M time:iso 2>/dev/null | python3 temp_logger.py sdr" \; \
     new-window -t sdr -n web \
-    "/home/jsn/landing/cc_projects/.venv/bin/python sdr/web_temps.py --dir sdr/sdr"
+    "python3 web_temps.py --dir sdr"
 
 ExecStop=/usr/bin/tmux kill-session -t sdr
 
