@@ -110,7 +110,15 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    print(f"Bot started (user_id={ALLOWED_USER}, server={SERVER_URL})")
+    # Verify token on startup
+    try:
+        me = tg_request("getMe")
+        bot_name = me.get("result", {}).get("username", "unknown")
+        print(f"Bot @{bot_name} started (user_id={ALLOWED_USER}, server={SERVER_URL})")
+    except Exception as e:
+        print(f"ERROR: could not connect to Telegram API: {e}", file=sys.stderr)
+        print(f"Check your bot token in {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
 
     offset = 0
     while True:
@@ -119,8 +127,15 @@ def main():
                 "offset": offset,
                 "timeout": POLL_TIMEOUT,
             })
-            for update in result.get("result", []):
+            updates = result.get("result", [])
+            if updates:
+                print(f"[tg] received {len(updates)} update(s)")
+            for update in updates:
                 offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                user = msg.get("from", {})
+                text = msg.get("text", "")
+                print(f"[tg] {user.get('username', user.get('id', '?'))}: {text}")
                 handle_update(update)
         except urllib.error.URLError as e:
             print(f"[tg] poll error: {e}", file=sys.stderr)
