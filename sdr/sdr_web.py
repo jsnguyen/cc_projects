@@ -177,7 +177,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Temperature &mdash; Last 7 Days (12h Phase Fold)</h1>
+<h1>Temperature &mdash; Last 7 Days (24h Overlay)</h1>
 <div class="status" id="status">connecting...</div>
 <div class="current" id="current"></div>
 <div id="chart"></div>
@@ -200,7 +200,7 @@ function initChart() {
   svg = d3.select("#chart").append("svg").attr("width", W).attr("height", H);
   g = svg.append("g").attr("transform", "translate(" + margin.left + "," + margin.top + ")");
 
-  x = d3.scaleLinear().domain([0, 12]).range([0, w]);
+  x = d3.scaleLinear().domain([0, 24]).range([0, w]);
   y = d3.scaleLinear().range([h, 0]);
 
   g.append("g").attr("class", "grid");
@@ -208,7 +208,7 @@ function initChart() {
   yAxisG = g.append("g");
 
   g.append("text").attr("x", w / 2).attr("y", h + 42).attr("text-anchor", "middle")
-    .attr("fill", "#99aabc").attr("font-size", 12).text("Time of Day (12h folded)");
+    .attr("fill", "#99aabc").attr("font-size", 12).text("Time of Day");
   g.append("text").attr("transform", "rotate(-90)").attr("x", -h / 2).attr("y", -46)
     .attr("text-anchor", "middle").attr("fill", "#99aabc").attr("font-size", 12)
     .text("Temperature (\u00b0F)");
@@ -224,14 +224,15 @@ function chName(key) {
 
 function phaseHour(d) {
   var t = d.time;
-  return (t.getHours() % 12) + t.getMinutes() / 60 + t.getSeconds() / 3600;
+  return t.getHours() + t.getMinutes() / 60 + t.getSeconds() / 3600;
 }
 
 function fmtPhaseHour(h) {
   var hr = Math.floor(h);
-  if (hr === 0) return "12 AM";
+  if (hr === 0 || hr === 24) return "12 AM";
+  if (hr === 12) return "12 PM";
   if (hr < 12) return hr + " AM";
-  return "12 PM";
+  return (hr - 12) + " PM";
 }
 
 function updateChart(data) {
@@ -261,7 +262,7 @@ function updateChart(data) {
     .attr("stroke", "#2a2a4a").attr("stroke-dasharray", "2,4");
   gridSel.exit().remove();
 
-  var xTicks = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  var xTicks = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24];
   xAxisG.call(d3.axisBottom(x).tickValues(xTicks).tickFormat(fmtPhaseHour))
     .selectAll("text,line,path").attr("stroke", "#556").attr("fill", "#889");
 
