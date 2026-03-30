@@ -8,8 +8,10 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -88,11 +90,15 @@ def load_sensors(npz_path: Path) -> dict[str, dict]:
         return sensors
     keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
     for key in keys:
-        sensors[key] = {
-            "time": npz[f"{key}_time"],
-            "temp_f": npz[f"{key}_temp_f"],
-            "humidity": npz[f"{key}_humidity"],
-        }
+        try:
+            sensors[key] = {
+                "time": npz[f"{key}_time"],
+                "temp_f": npz[f"{key}_temp_f"],
+                "humidity": npz[f"{key}_humidity"],
+            }
+        except Exception as e:
+            log.error("corrupt arrays for %s in %s: %s — skipping", key, npz_path.name, e)
+            continue
     log.info("loaded %d sensors from %s", len(keys), npz_path.name)
     return sensors
 
@@ -105,7 +111,15 @@ def save_sensors(sensors: dict, out_dir: Path, week_start: datetime, week_end: d
         npz_data[f"{key}_temp_f"] = arrs["temp_f"]
         npz_data[f"{key}_humidity"] = arrs["humidity"]
     if npz_data:
-        np.savez_compressed(npz_path, **npz_data)
+        # Atomic write: temp file -> rename, so readers never see partial data
+        fd, tmp = tempfile.mkstemp(suffix=".npz", dir=out_dir)
+        os.close(fd)
+        try:
+            np.savez_compressed(tmp, **npz_data)
+            os.replace(tmp, npz_path)
+        except Exception:
+            os.unlink(tmp)
+            raise
         total = sum(len(a["time"]) for a in sensors.values())
         log.info("save: %d records -> %s", total, npz_path.name)
     else:
@@ -155,8 +169,11 @@ def main():
             sys.stdin.close()
         except Exception:
             pass
-        save()
-        log.info("saved. exiting.")
+        try:
+            save()
+        except Exception as e:
+            log.error("save on shutdown failed: %s", e)
+        log.info("exiting.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)

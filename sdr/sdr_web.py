@@ -91,25 +91,39 @@ def load_sensors_from_disk(out_dir: Path) -> dict[str, dict]:
     for npz_path in paths_to_load:
         if not npz_path.exists():
             continue
-        try:
-            npz = np.load(npz_path)
-        except Exception as e:
-            log.error("failed to load %s: %s", npz_path.name, e)
+        # Retry once — the logger does atomic writes, but we may catch mid-rename
+        for attempt in range(2):
+            try:
+                npz = np.load(npz_path)
+                break
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                log.error("failed to load %s: %s", npz_path.name, e)
+                npz = None
+        if npz is None:
             continue
-        keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
-        for key in keys:
-            t = npz[f"{key}_time"]
-            tf = npz[f"{key}_temp_f"]
-            h = npz[f"{key}_humidity"]
-            if key in sensors:
-                # Append to existing
-                sensors[key]["time"] = np.concatenate([sensors[key]["time"], t])
-                sensors[key]["temp_f"] = np.concatenate([sensors[key]["temp_f"], tf])
-                sensors[key]["humidity"] = np.concatenate([sensors[key]["humidity"], h])
-            else:
-                sensors[key] = {"time": t, "temp_f": tf, "humidity": h}
+        try:
+            keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
+            for key in keys:
+                try:
+                    t = npz[f"{key}_time"]
+                    tf = npz[f"{key}_temp_f"]
+                    h = npz[f"{key}_humidity"]
+                except Exception as e:
+                    log.error("corrupt arrays for %s in %s: %s — skipping", key, npz_path.name, e)
+                    continue
+                if key in sensors:
+                    sensors[key]["time"] = np.concatenate([sensors[key]["time"], t])
+                    sensors[key]["temp_f"] = np.concatenate([sensors[key]["temp_f"], tf])
+                    sensors[key]["humidity"] = np.concatenate([sensors[key]["humidity"], h])
+                else:
+                    sensors[key] = {"time": t, "temp_f": tf, "humidity": h}
+        finally:
+            npz.close()
 
-    # Filter to last 24h only
+    # Filter to last 7 days
     for key in list(sensors):
         mask = sensors[key]["time"] >= cutoff
         if not mask.any():
@@ -369,7 +383,8 @@ function updateCurrent(data, keys) {
   keys.forEach(function(key, i) {
     var records = data[key];
     if (!records || records.length === 0) return;
-    var last = records[records.length - 1];
+    // Find most recent by actual timestamp (records are phase-sorted, not time-sorted)
+    var last = records.reduce(function(a, b) { return new Date(a.time) > new Date(b.time) ? a : b; });
     var name = chName(key);
     var color = COLORS[i % COLORS.length];
 
@@ -491,7 +506,7 @@ def main():
     # Initial load
     _sensors = load_sensors_from_disk(_out_dir)
     n = sum(len(a["time"]) for a in _sensors.values())
-    log.info("loaded %d records (last 24h) from %s", n, _out_dir)
+    log.info("loaded %d records (last 7d) from %s", n, _out_dir)
     _version = 1 if _sensors else 0
 
     # Start disk poller
