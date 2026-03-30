@@ -73,23 +73,20 @@ def find_chunks(out_dir: Path) -> list[Path]:
 
 
 def load_sensors_from_disk(out_dir: Path) -> dict[str, dict]:
-    """Load sensors from the current week's chunk (and previous if needed for 24h window)."""
+    """Load sensors from chunks covering the last 7 days."""
     now = datetime.now()
-    week_start, week_end = week_bounds(now)
-    cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+    cutoff = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
 
     sensors: dict[str, dict] = {}
 
-    # Load current week
+    # Load current week + previous week (covers any 7-day window)
+    week_start, week_end = week_bounds(now)
     paths_to_load = [chunk_path(out_dir, week_start, week_end)]
-
-    # If we're early in the week, also load previous week for 24h coverage
-    if now - week_start < timedelta(hours=24):
-        prev_start = week_start - timedelta(days=7)
-        prev_end = week_start
-        prev = chunk_path(out_dir, prev_start, prev_end)
-        if prev.exists():
-            paths_to_load.insert(0, prev)
+    prev_start = week_start - timedelta(days=7)
+    prev_end = week_start
+    prev = chunk_path(out_dir, prev_start, prev_end)
+    if prev.exists():
+        paths_to_load.insert(0, prev)
 
     for npz_path in paths_to_load:
         if not npz_path.exists():
@@ -151,7 +148,7 @@ def get_latest_temps() -> dict:
     return result
 
 
-def get_last_24h() -> dict:
+def get_last_7d() -> dict:
     with _lock:
         snapshot = {k: {f: v.copy() for f, v in arrs.items()} for k, arrs in _sensors.items()}
     result = {}
@@ -219,7 +216,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Temperature &mdash; Last 24 Hours</h1>
+<h1>Temperature &mdash; Last 7 Days (12h Phase Fold)</h1>
 <div class="status" id="status">connecting...</div>
 <div class="current" id="current"></div>
 <div id="chart"></div>
@@ -242,7 +239,7 @@ function initChart() {
   svg = d3.select("#chart").append("svg").attr("width", W).attr("height", H);
   g = svg.append("g").attr("transform", "translate(" + margin.left + "," + margin.top + ")");
 
-  x = d3.scaleTime().range([0, w]);
+  x = d3.scaleLinear().domain([0, 12]).range([0, w]);
   y = d3.scaleLinear().range([h, 0]);
 
   g.append("g").attr("class", "grid");
@@ -250,7 +247,7 @@ function initChart() {
   yAxisG = g.append("g");
 
   g.append("text").attr("x", w / 2).attr("y", h + 42).attr("text-anchor", "middle")
-    .attr("fill", "#99aabc").attr("font-size", 12).text("Time");
+    .attr("fill", "#99aabc").attr("font-size", 12).text("Time of Day (12h folded)");
   g.append("text").attr("transform", "rotate(-90)").attr("x", -h / 2).attr("y", -46)
     .attr("text-anchor", "middle").attr("fill", "#99aabc").attr("font-size", 12)
     .text("Temperature (\u00b0F)");
@@ -264,6 +261,19 @@ function chName(key) {
   return CHANNEL_NAMES[chNum] || ("Channel " + chNum);
 }
 
+function phaseHour(d) {
+  // Fold 24h into 12h: hour-of-day mod 12 as fractional hours
+  var t = d.time;
+  return (t.getHours() % 12) + t.getMinutes() / 60 + t.getSeconds() / 3600;
+}
+
+function fmtPhaseHour(h) {
+  var hr = Math.floor(h);
+  if (hr === 0) return "12 AM";
+  if (hr < 12) return hr + " AM";
+  return "12 PM";
+}
+
 function updateChart(data) {
   var keys = Object.keys(data).sort();
 
@@ -273,15 +283,13 @@ function updateChart(data) {
     var pts = data[key].map(function(r) {
       return { time: new Date(r.time), temp: r.temp_f, humidity: r.humidity, key: key };
     });
+    // Sort by phase hour so lines don't zig-zag
+    pts.sort(function(a, b) { return phaseHour(a) - phaseHour(b); });
     series[key] = pts;
     allPoints = allPoints.concat(pts);
   });
 
   if (allPoints.length === 0) return;
-
-  var now = new Date();
-  var t0 = new Date(now - 24 * 3600 * 1000);
-  x.domain([t0, now]);
 
   var temps = allPoints.map(function(d) { return d.temp; });
   y.domain([d3.min(temps) - 1, d3.max(temps) + 1]).nice();
@@ -294,14 +302,15 @@ function updateChart(data) {
     .attr("stroke", "#2a2a4a").attr("stroke-dasharray", "2,4");
   gridSel.exit().remove();
 
-  xAxisG.call(d3.axisBottom(x).ticks(8).tickFormat(d3.timeFormat("%H:%M")))
+  var xTicks = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  xAxisG.call(d3.axisBottom(x).tickValues(xTicks).tickFormat(fmtPhaseHour))
     .selectAll("text,line,path").attr("stroke", "#556").attr("fill", "#889");
 
   yAxisG.call(d3.axisLeft(y).ticks(8).tickFormat(function(d) { return d + "\u00b0F"; }))
     .selectAll("text,line,path").attr("stroke", "#556").attr("fill", "#889");
 
   var line = d3.line()
-    .x(function(d) { return x(d.time); })
+    .x(function(d) { return x(phaseHour(d)); })
     .y(function(d) { return y(d.temp); })
     .curve(d3.curveMonotoneX);
 
@@ -318,10 +327,11 @@ function updateChart(data) {
       .attr("r", 3).attr("fill", color).attr("opacity", 0)
       .on("mouseover", function(ev, d) {
         d3.select(this).attr("opacity", 1).attr("r", 5).attr("stroke", "#fff").attr("stroke-width", 1);
+        var ampm = d.time.getHours() < 12 ? "AM" : "PM";
         tip.style("display", "block").html(
-          "<strong>" + chName(d.key) + "</strong><br>" +
+          "<strong>" + chName(d.key) + "</strong> (" + ampm + ")<br>" +
           d.temp.toFixed(1) + "\u00b0F, " + d.humidity.toFixed(0) + "% humidity<br>" +
-          d.time.toLocaleTimeString()
+          d.time.toLocaleString()
         );
       })
       .on("mousemove", function(ev) {
@@ -332,7 +342,7 @@ function updateChart(data) {
         tip.style("display", "none");
       })
       .merge(dots)
-      .attr("cx", function(d) { return x(d.time); })
+      .attr("cx", function(d) { return x(phaseHour(d)); })
       .attr("cy", function(d) { return y(d.temp); });
     dots.exit().remove();
   });
@@ -440,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
                     with _lock:
                         ver = _version
                     if ver != last_ver:
-                        data = get_last_24h()
+                        data = get_last_7d()
                         payload = json.dumps(data, separators=(",", ":"))
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
