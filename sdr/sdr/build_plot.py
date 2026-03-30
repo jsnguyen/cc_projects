@@ -1,35 +1,37 @@
 #!/usr/bin/env python3
-"""Build phase_plot.html with inline temperature data from all weekly .npz chunks."""
+"""Build phase_plot.html with inline temperature data from SQLite database."""
 import json
+import sqlite3
 from pathlib import Path
 
-import numpy as np
-
 HERE = Path(__file__).parent
+DB_PATH = HERE / "temps.db"
 
 
-def load_all_chunks(directory: Path) -> dict[str, list[dict]]:
-    """Load and merge all .npz chunks into {sensor_key: [{time, temp_f, humidity}]}."""
+def load_all_data(db_path: Path) -> dict[str, list[dict]]:
+    """Load all readings from SQLite grouped by sensor."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT sensor, time, temp_f, humidity FROM readings ORDER BY sensor, time"
+    ).fetchall()
+    conn.close()
+
     data: dict[str, list[dict]] = {}
-    chunks = sorted(directory.glob("temp_log_????????_????????.npz"))
-    if not chunks and (directory / "temp_log.npz").exists():
-        chunks = [directory / "temp_log.npz"]
-    for chunk in chunks:
-        npz = np.load(chunk)
-        keys = {n[:-5] for n in npz.files if n.endswith("_time")}
-        for key in sorted(keys):
-            times = npz[f"{key}_time"]
-            temps = npz[f"{key}_temp_f"]
-            humids = npz[f"{key}_humidity"]
-            records = [
-                {"time": str(t), "temp_f": float(tf), "humidity": float(h)}
-                for t, tf, h in zip(times, temps, humids)
-            ]
-            data.setdefault(key, []).extend(records)
+    for row in rows:
+        data.setdefault(row["sensor"], []).append({
+            "time": row["time"],
+            "temp_f": row["temp_f"],
+            "humidity": row["humidity"],
+        })
     return data
 
 
-data = load_all_chunks(HERE)
+if not DB_PATH.exists():
+    print(f"Database not found: {DB_PATH}")
+    raise SystemExit(1)
+
+data = load_all_data(DB_PATH)
 filtered = {k: v for k, v in data.items() if k.startswith("Oregon")}
 json_str = json.dumps(filtered, separators=(",", ":"))
 
@@ -168,7 +170,6 @@ var tip = d3.select("#tip");
 var nBins = 48;
 var chKeys = Object.keys(channels).sort();
 
-// Track SVG elements per channel for toggling
 var chGroups = {};
 var dotsVisible = false;
 
@@ -215,8 +216,7 @@ chKeys.forEach(function(ch) {
     .attr("fill", "none").attr("stroke", color).attr("stroke-width", 1.2)
     .attr("stroke-dasharray", "5,4").attr("opacity", 0.6);
 
-  // Scatter points — hidden by default, subsampled for performance
-  // Use every 3rd point to reduce clutter
+  // Scatter points — hidden by default, subsampled
   var subPts = pts.filter(function(_, i) { return i % 3 === 0; });
   var dots = chG.selectAll(".dot-" + ch).data(subPts).join("circle")
     .attr("cx", function(d) { return x(d.phase); })
@@ -227,7 +227,7 @@ chKeys.forEach(function(ch) {
       tip.style("display", "block").html(
         "<strong>" + NAMES[ch] + "</strong><br>" +
         "Temp: <strong>" + d.temp.toFixed(1) + "\u00b0F</strong><br>" +
-        "Humidity: " + d.humidity + "%<br>" +
+        "Humidity: " + (d.humidity != null ? d.humidity + "%" : "n/a") + "<br>" +
         "Time: " + d.time.replace("T", " ") + "<br>" +
         "Date: " + d.date
       );
@@ -241,7 +241,7 @@ chKeys.forEach(function(ch) {
     });
   chGroups[ch].dots = dots;
 
-  // Invisible wider hover target along the median for tooltip on the stat curve
+  // Invisible hover target along median
   var hoverLine = chG.selectAll(".hover-" + ch).data(stats).join("circle")
     .attr("cx", function(d) { return x(d.phase); })
     .attr("cy", function(d) { return y(d.median); })
@@ -265,7 +265,6 @@ chKeys.forEach(function(ch) {
 // Controls
 var controls = d3.select("#controls");
 
-// Toggle dots button
 var dotBtn = controls.append("button").attr("class", "toggle-btn")
   .text("Show Data Points")
   .on("click", function() {
@@ -278,7 +277,6 @@ var dotBtn = controls.append("button").attr("class", "toggle-btn")
     });
   });
 
-// Per-channel toggle buttons
 chKeys.forEach(function(ch) {
   var visible = true;
   var btn = controls.append("button").attr("class", "toggle-btn active")

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""SDR temperature web dashboard — reads .npz chunks from disk, serves live dashboard.
+"""SDR temperature web dashboard — reads from SQLite, serves live dashboard.
 
 Usage:
     python sdr/sdr_web.py [--port 8433] [--dir sdr/sdr]
 
 Endpoints:
-    GET /       — D3.js dashboard (last 24 hours)
+    GET /       — D3.js dashboard (last 7 days, 12h phase fold)
     GET /temps  — JSON of latest readings per sensor
     GET /stream — Server-Sent Events for real-time updates
 """
@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -21,8 +22,6 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
-
-import numpy as np
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,7 +36,7 @@ log = logging.getLogger("sdr_web")
 
 # --- Config ---
 
-POLL_INTERVAL = 10  # seconds between disk reads
+POLL_INTERVAL = 10  # seconds between DB checks
 SSE_TIMEOUT = 300   # drop idle SSE connections after 5 minutes
 
 CHANNEL_NAMES = {
@@ -49,96 +48,19 @@ CHANNEL_NAMES = {
 # --- Shared state ---
 
 _lock = threading.Lock()
-_sensors: dict[str, dict] = {}
 _version = 0
-_out_dir = Path("sdr/sdr")
+_db_path: Path = Path("sdr/sdr/temps.db")
 
 
-# --- Numpy storage helpers ---
+# --- DB helpers ---
 
-def week_bounds(dt: datetime) -> tuple[datetime, datetime]:
-    monday = dt - timedelta(days=dt.weekday())
-    start = monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    return start, start + timedelta(days=7)
+def _get_conn() -> sqlite3.Connection:
+    """Open a read-only connection to the DB."""
+    uri = f"file:{_db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-
-def chunk_path(out_dir: Path, start: datetime, end: datetime) -> Path:
-    s = start.strftime("%Y%m%d")
-    e = end.strftime("%Y%m%d")
-    return out_dir / f"temp_log_{s}_{e}.npz"
-
-
-def find_chunks(out_dir: Path) -> list[Path]:
-    return sorted(out_dir.glob("temp_log_????????_????????.npz"))
-
-
-def load_sensors_from_disk(out_dir: Path) -> dict[str, dict]:
-    """Load sensors from chunks covering the last 7 days."""
-    now = datetime.now()
-    cutoff = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
-
-    sensors: dict[str, dict] = {}
-
-    # Load current week + previous week (covers any 7-day window)
-    week_start, week_end = week_bounds(now)
-    paths_to_load = [chunk_path(out_dir, week_start, week_end)]
-    prev_start = week_start - timedelta(days=7)
-    prev_end = week_start
-    prev = chunk_path(out_dir, prev_start, prev_end)
-    if prev.exists():
-        paths_to_load.insert(0, prev)
-
-    for npz_path in paths_to_load:
-        if not npz_path.exists():
-            continue
-        # Retry once — the logger does atomic writes, but we may catch mid-rename
-        for attempt in range(2):
-            try:
-                npz = np.load(npz_path)
-                break
-            except Exception as e:
-                if attempt == 0:
-                    time.sleep(0.5)
-                    continue
-                log.error("failed to load %s: %s", npz_path.name, e)
-                npz = None
-        if npz is None:
-            continue
-        try:
-            keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
-            for key in keys:
-                try:
-                    t = npz[f"{key}_time"]
-                    tf = npz[f"{key}_temp_f"]
-                    h = npz[f"{key}_humidity"]
-                except Exception as e:
-                    log.error("corrupt arrays for %s in %s: %s — skipping", key, npz_path.name, e)
-                    continue
-                if key in sensors:
-                    sensors[key]["time"] = np.concatenate([sensors[key]["time"], t])
-                    sensors[key]["temp_f"] = np.concatenate([sensors[key]["temp_f"], tf])
-                    sensors[key]["humidity"] = np.concatenate([sensors[key]["humidity"], h])
-                else:
-                    sensors[key] = {"time": t, "temp_f": tf, "humidity": h}
-        finally:
-            npz.close()
-
-    # Filter to last 7 days
-    for key in list(sensors):
-        mask = sensors[key]["time"] >= cutoff
-        if not mask.any():
-            del sensors[key]
-            continue
-        sensors[key] = {
-            "time": sensors[key]["time"][mask],
-            "temp_f": sensors[key]["temp_f"][mask],
-            "humidity": sensors[key]["humidity"][mask],
-        }
-
-    return sensors
-
-
-# --- Data access ---
 
 def channel_name(sensor_key: str) -> str:
     parts = sensor_key.split("_ch")
@@ -147,55 +69,80 @@ def channel_name(sensor_key: str) -> str:
 
 
 def get_latest_temps() -> dict:
-    with _lock:
-        sensors = _sensors
+    try:
+        conn = _get_conn()
+        rows = conn.execute("""
+            SELECT sensor, time, temp_f, humidity
+            FROM readings
+            WHERE (sensor, time) IN (
+                SELECT sensor, MAX(time) FROM readings GROUP BY sensor
+            )
+            ORDER BY sensor
+        """).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        log.error("get_latest_temps query failed: %s", e)
+        return {}
+
     result = {}
-    for key in sorted(sensors):
-        arrs = sensors[key]
-        if len(arrs["time"]) == 0:
-            continue
-        result[channel_name(key)] = {
-            "temp_f": round(float(arrs["temp_f"][-1]), 2),
-            "humidity": round(float(arrs["humidity"][-1]), 1),
-            "time": str(arrs["time"][-1]),
+    for row in rows:
+        result[channel_name(row["sensor"])] = {
+            "temp_f": round(row["temp_f"], 2),
+            "humidity": round(row["humidity"], 1) if row["humidity"] is not None else None,
+            "time": row["time"],
         }
     return result
 
 
 def get_last_7d() -> dict:
-    with _lock:
-        snapshot = {k: {f: v.copy() for f, v in arrs.items()} for k, arrs in _sensors.items()}
-    result = {}
-    for key, arrs in sorted(snapshot.items()):
-        if len(arrs["time"]) == 0:
-            continue
-        result[key] = [
-            {"time": str(t), "temp_f": round(float(tf), 2), "humidity": round(float(h), 1)}
-            for t, tf, h in zip(arrs["time"], arrs["temp_f"], arrs["humidity"])
-        ]
+    cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        conn = _get_conn()
+        rows = conn.execute("""
+            SELECT sensor, time, temp_f, humidity
+            FROM readings
+            WHERE time >= ?
+            ORDER BY sensor, time
+        """, (cutoff,)).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        log.error("get_last_7d query failed: %s", e)
+        return {}
+
+    result: dict[str, list] = {}
+    for row in rows:
+        sensor = row["sensor"]
+        result.setdefault(sensor, []).append({
+            "time": row["time"],
+            "temp_f": round(row["temp_f"], 2),
+            "humidity": round(row["humidity"], 1) if row["humidity"] is not None else None,
+        })
     return result
 
 
-# --- Disk poller thread ---
+# --- DB poller thread ---
 
-def disk_poller():
-    """Periodically reload sensor data from npz files on disk."""
-    global _sensors, _version
+def db_poller():
+    """Check for new data and bump version when found."""
+    global _version
+    last_max_time = None
     while True:
         time.sleep(POLL_INTERVAL)
         try:
-            new_sensors = load_sensors_from_disk(_out_dir)
-            # Check if data actually changed
-            new_count = sum(len(a["time"]) for a in new_sensors.values())
+            conn = _get_conn()
+            row = conn.execute("SELECT MAX(time) AS mt FROM readings").fetchone()
+            conn.close()
+            max_time = row["mt"] if row else None
+        except sqlite3.Error as e:
+            log.error("db poll error: %s", e)
+            continue
+
+        if max_time != last_max_time:
+            last_max_time = max_time
             with _lock:
-                old_count = sum(len(a["time"]) for a in _sensors.values())
-            if new_count != old_count:
-                with _lock:
-                    _sensors = new_sensors
-                    _version += 1
-                log.info("reload: %d records from disk", new_count)
-        except Exception as e:
-            log.error("disk poll error: %s", e)
+                _version += 1
+            if max_time:
+                log.info("new data detected (latest: %s)", max_time)
 
 
 # --- HTML dashboard ---
@@ -276,7 +223,6 @@ function chName(key) {
 }
 
 function phaseHour(d) {
-  // Fold 24h into 12h: hour-of-day mod 12 as fractional hours
   var t = d.time;
   return (t.getHours() % 12) + t.getMinutes() / 60 + t.getSeconds() / 3600;
 }
@@ -297,7 +243,6 @@ function updateChart(data) {
     var pts = data[key].map(function(r) {
       return { time: new Date(r.time), temp: r.temp_f, humidity: r.humidity, key: key };
     });
-    // Sort by phase hour so lines don't zig-zag
     pts.sort(function(a, b) { return phaseHour(a) - phaseHour(b); });
     series[key] = pts;
     allPoints = allPoints.concat(pts);
@@ -323,28 +268,20 @@ function updateChart(data) {
   yAxisG.call(d3.axisLeft(y).ticks(8).tickFormat(function(d) { return d + "\u00b0F"; }))
     .selectAll("text,line,path").attr("stroke", "#556").attr("fill", "#889");
 
-  var line = d3.line()
-    .x(function(d) { return x(phaseHour(d)); })
-    .y(function(d) { return y(d.temp); })
-    .curve(d3.curveMonotoneX);
-
   keys.forEach(function(key, i) {
     var color = COLORS[i % COLORS.length];
-    var sel = g.selectAll(".line-" + i).data([series[key]]);
-    sel.enter().append("path").attr("class", "line-" + i)
-      .attr("fill", "none").attr("stroke", color).attr("stroke-width", 2)
-      .merge(sel).attr("d", line);
 
-    var sparse = series[key].filter(function(_, j) { return j % 5 === 0; });
-    var dots = g.selectAll(".dot-" + i).data(sparse);
+    g.selectAll(".dot-" + i).remove();
+
+    var dots = g.selectAll(".dot-" + i).data(series[key]);
     dots.enter().append("circle").attr("class", "dot-" + i)
-      .attr("r", 3).attr("fill", color).attr("opacity", 0)
+      .attr("r", 2).attr("fill", color).attr("opacity", 0.3)
       .on("mouseover", function(ev, d) {
         d3.select(this).attr("opacity", 1).attr("r", 5).attr("stroke", "#fff").attr("stroke-width", 1);
         var ampm = d.time.getHours() < 12 ? "AM" : "PM";
         tip.style("display", "block").html(
           "<strong>" + chName(d.key) + "</strong> (" + ampm + ")<br>" +
-          d.temp.toFixed(1) + "\u00b0F, " + d.humidity.toFixed(0) + "% humidity<br>" +
+          d.temp.toFixed(1) + "\u00b0F, " + (d.humidity != null ? d.humidity.toFixed(0) + "%" : "n/a") + " humidity<br>" +
           d.time.toLocaleString()
         );
       })
@@ -352,7 +289,7 @@ function updateChart(data) {
         tip.style("left", (ev.pageX + 14) + "px").style("top", (ev.pageY - 20) + "px");
       })
       .on("mouseout", function() {
-        d3.select(this).attr("opacity", 0).attr("r", 3).attr("stroke", "none");
+        d3.select(this).attr("opacity", 0.3).attr("r", 2).attr("stroke", "none");
         tip.style("display", "none");
       })
       .merge(dots)
@@ -383,7 +320,6 @@ function updateCurrent(data, keys) {
   keys.forEach(function(key, i) {
     var records = data[key];
     if (!records || records.length === 0) return;
-    // Find most recent by actual timestamp (records are phase-sorted, not time-sorted)
     var last = records.reduce(function(a, b) { return new Date(a.time) > new Date(b.time) ? a : b; });
     var name = chName(key);
     var color = COLORS[i % COLORS.length];
@@ -392,7 +328,7 @@ function updateCurrent(data, keys) {
     card.append("div").attr("class", "label").text(name);
     card.append("div").attr("class", "temp").style("color", color)
       .text(last.temp_f.toFixed(1) + "\u00b0F");
-    var hum = isNaN(last.humidity) ? "n/a" : last.humidity.toFixed(0) + "% humidity";
+    var hum = (last.humidity != null && !isNaN(last.humidity)) ? last.humidity.toFixed(0) + "% humidity" : "n/a";
     card.append("div").attr("class", "humid").text(hum);
     var t = last.time.replace("T", " ").substring(0, 19);
     card.append("div").attr("class", "time").text(t);
@@ -491,27 +427,32 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # --- Main ---
 
 def main():
-    global _sensors, _version, _out_dir
+    global _version, _db_path
 
     parser = argparse.ArgumentParser(description="SDR temperature web dashboard")
     parser.add_argument("--port", type=int, default=8433)
-    parser.add_argument("--dir", default="sdr/sdr", help="Directory for .npz chunks")
+    parser.add_argument("--dir", default="sdr/sdr", help="Directory containing temps.db")
     args = parser.parse_args()
 
-    _out_dir = Path(args.dir)
-    if not _out_dir.exists():
-        log.error("data directory %s does not exist", _out_dir)
+    _db_path = Path(args.dir) / "temps.db"
+    if not _db_path.exists():
+        log.error("database %s does not exist", _db_path)
         sys.exit(1)
 
-    # Initial load
-    _sensors = load_sensors_from_disk(_out_dir)
-    n = sum(len(a["time"]) for a in _sensors.values())
-    log.info("loaded %d records (last 7d) from %s", n, _out_dir)
-    _version = 1 if _sensors else 0
+    # Check we can open it
+    try:
+        conn = _get_conn()
+        n = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        conn.close()
+        log.info("opened %s: %d rows", _db_path, n)
+    except sqlite3.Error as e:
+        log.error("failed to open database: %s", e)
+        sys.exit(1)
 
-    # Start disk poller
-    log.info("starting disk poller (interval=%ds)...", POLL_INTERVAL)
-    threading.Thread(target=disk_poller, daemon=True).start()
+    _version = 1 if n > 0 else 0
+
+    log.info("starting db poller (interval=%ds)...", POLL_INTERVAL)
+    threading.Thread(target=db_poller, daemon=True).start()
 
     def shutdown(sig, frame):
         log.info("shutdown signal received (sig=%d)", sig)

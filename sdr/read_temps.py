@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read latest temperature sensor data from .npz chunk files.
+"""Read latest temperature sensor data from SQLite database.
 
 Usage:
     python sdr/read_temps.py [options] [data_dir]
@@ -8,69 +8,66 @@ Options:
     -n N        Show last N readings per sensor (default: 1)
     -a, --all   Show all sensors (default: only latest per sensor)
     --json      Output as JSON
-    data_dir    Directory containing .npz chunks (default: sdr/sdr)
+    data_dir    Directory containing temps.db (default: sdr/sdr)
 """
 
 import argparse
 import json
+import math
+import sqlite3
 import sys
 from pathlib import Path
 
-import numpy as np
+CHANNEL_NAMES = {
+    "0": "Bedroom",
+    "1": "Living Room",
+    "2": "Garage",
+}
 
 
-def find_chunks(data_dir: Path) -> list[Path]:
-    chunks = sorted(data_dir.glob("temp_log_????????_????????.npz"))
-    if not chunks and (data_dir / "temp_log.npz").exists():
-        chunks = [data_dir / "temp_log.npz"]
-    return chunks
+def channel_name(sensor_key: str) -> str:
+    parts = sensor_key.split("_ch")
+    ch = parts[1] if len(parts) > 1 else sensor_key
+    return CHANNEL_NAMES.get(ch, f"Channel {ch}")
 
 
-def load_latest(data_dir: Path, n: int = 1) -> dict[str, list[dict]]:
-    """Load last N records per sensor from the most recent chunk(s)."""
+def load_latest(db_path: Path, n: int = 1) -> dict[str, list[dict]]:
+    """Load last N records per sensor."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    sensors = [r[0] for r in conn.execute("SELECT DISTINCT sensor FROM readings ORDER BY sensor")]
     result: dict[str, list[dict]] = {}
-    # Walk chunks newest-first, stop once every sensor has enough records
-    for chunk_path in reversed(find_chunks(data_dir)):
-        npz = np.load(chunk_path)
-        keys = sorted({name[:-5] for name in npz.files if name.endswith("_time")})
-        for key in keys:
-            if key in result and len(result[key]) >= n:
-                continue
-            times = npz[f"{key}_time"]
-            temps = npz[f"{key}_temp_f"]
-            humids = npz[f"{key}_humidity"]
-            need = n - len(result.get(key, []))
-            tail = slice(-need, None) if need < len(times) else slice(None)
-            records = [
-                {"time": str(t), "temp_f": float(tf), "humidity": float(h)}
-                for t, tf, h in zip(times[tail], temps[tail], humids[tail])
-            ]
-            result.setdefault(key, [])
-            result[key] = records + result[key]  # prepend older records
+    for sensor in sensors:
+        rows = conn.execute(
+            "SELECT time, temp_f, humidity FROM readings WHERE sensor = ? ORDER BY time DESC LIMIT ?",
+            (sensor, n),
+        ).fetchall()
+        result[sensor] = [
+            {"time": r["time"], "temp_f": r["temp_f"], "humidity": r["humidity"]}
+            for r in reversed(rows)  # oldest first
+        ]
+
+    conn.close()
     return result
 
 
 def main():
     parser = argparse.ArgumentParser(description="Read temperature sensor data")
     parser.add_argument("data_dir", nargs="?", default="sdr/sdr",
-                        help="Directory with .npz chunks (default: sdr/sdr)")
+                        help="Directory with temps.db (default: sdr/sdr)")
     parser.add_argument("-n", type=int, default=1,
                         help="Last N readings per sensor (default: 1)")
     parser.add_argument("--json", action="store_true",
                         help="Output as JSON")
     args = parser.parse_args()
 
-    data_dir = Path(args.data_dir)
-    if not data_dir.exists():
-        print(f"No data directory: {data_dir}", file=sys.stderr)
+    db_path = Path(args.data_dir) / "temps.db"
+    if not db_path.exists():
+        print(f"No database: {db_path}", file=sys.stderr)
         sys.exit(1)
 
-    chunks = find_chunks(data_dir)
-    if not chunks:
-        print("No .npz chunk files found.", file=sys.stderr)
-        sys.exit(1)
-
-    readings = load_latest(data_dir, n=args.n)
+    readings = load_latest(db_path, n=args.n)
     if not readings:
         print("No sensor data found.", file=sys.stderr)
         sys.exit(1)
@@ -82,24 +79,27 @@ def main():
 
     # Pretty-print
     for sensor, records in sorted(readings.items()):
-        label = sensor.replace("_", " ")
-        print(f"\n  {label}")
+        label = channel_name(sensor)
+        print(f"\n  {label} ({sensor})")
         print(f"  {'─' * 50}")
         for r in records:
             t = r["time"].replace("T", " ")
-            hum = f"{r['humidity']:.0f}%" if not np.isnan(r["humidity"]) else "n/a"
-            print(f"    {t}  {r['temp_f']:6.1f}°F  {hum:>4s}")
+            h = r["humidity"]
+            h_str = f"{h:.0f}%" if h is not None and not math.isnan(h) else "n/a"
+            print(f"    {t}  {r['temp_f']:6.1f}°F  {h_str:>4s}")
 
-    # Summary line
-    total_chunks = len(chunks)
-    total_size = sum(p.stat().st_size for p in chunks)
-    total_records = 0
-    npz = np.load(chunks[-1])
-    for name in npz.files:
-        if name.endswith("_time"):
-            total_records += len(npz[name])
-    print(f"\n  {total_chunks} chunk(s), {total_size / 1e6:.1f} MB total, "
-          f"{total_records} records in latest chunk")
+    # Summary
+    try:
+        conn = sqlite3.connect(str(db_path))
+        total = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        span = conn.execute("SELECT MIN(time), MAX(time) FROM readings").fetchone()
+        conn.close()
+        size = db_path.stat().st_size
+        print(f"\n  {total} rows, {size / 1e6:.1f} MB")
+        if span[0]:
+            print(f"  range: {span[0]} → {span[1]}")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
