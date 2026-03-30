@@ -1,0 +1,17 @@
+[Unit]
+Description=SDR Temperature Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=jsn
+Environment=HOME=/home/jsn
+WorkingDirectory=/home/jsn/cc_projects/sdr
+
+ExecStart=/home/jsn/.pyenv/versions/3.14.3/bin/python3 sdr_web.py --dir sdr
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

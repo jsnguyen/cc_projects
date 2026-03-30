@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""SDR temperature logger + real-time web dashboard in a single process.
+"""SDR temperature web dashboard — reads .npz chunks from disk, serves live dashboard.
 
 Usage:
-    rtl_433 -F json -M time:iso | python sdr/temp_server.py [--port 8433] [--dir sdr/sdr]
-
-Reads 433 MHz sensor JSON from stdin, stores weekly .npz chunks (8 GB cap),
-and serves a live dashboard with SSE updates on the specified port.
+    python sdr/sdr_web.py [--port 8433] [--dir sdr/sdr]
 
 Endpoints:
     GET /       — D3.js dashboard (last 24 hours)
@@ -33,18 +30,15 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
-# Force unbuffered so journald sees output immediately
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-log = logging.getLogger("temp_server")
+log = logging.getLogger("sdr_web")
 
 # --- Config ---
 
-MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
-SAVE_INTERVAL = 60  # seconds between disk flushes
-STARTUP_TIMEOUT = 3000  # seconds to wait for first stdin data
-SSE_TIMEOUT = 300  # drop idle SSE connections after 5 minutes
+POLL_INTERVAL = 10  # seconds between disk reads
+SSE_TIMEOUT = 300   # drop idle SSE connections after 5 minutes
 
 CHANNEL_NAMES = {
     "0": "Bedroom",
@@ -55,18 +49,12 @@ CHANNEL_NAMES = {
 # --- Shared state ---
 
 _lock = threading.Lock()
-_sensors: dict[str, dict] = {}  # {safe_key: {time: ndarray, temp_f: ndarray, humidity: ndarray}}
+_sensors: dict[str, dict] = {}
 _version = 0
 _out_dir = Path("sdr/sdr")
-_week_start = datetime.min
-_week_end = datetime.min
 
 
 # --- Numpy storage helpers ---
-
-def c_to_f(c: float) -> float:
-    return c * 9.0 / 5.0 + 32.0
-
 
 def week_bounds(dt: datetime) -> tuple[datetime, datetime]:
     monday = dt - timedelta(days=dt.weekday())
@@ -84,68 +72,59 @@ def find_chunks(out_dir: Path) -> list[Path]:
     return sorted(out_dir.glob("temp_log_????????_????????.npz"))
 
 
-def total_chunk_size(out_dir: Path) -> int:
-    return sum(p.stat().st_size for p in find_chunks(out_dir))
+def load_sensors_from_disk(out_dir: Path) -> dict[str, dict]:
+    """Load sensors from the current week's chunk (and previous if needed for 24h window)."""
+    now = datetime.now()
+    week_start, week_end = week_bounds(now)
+    cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
 
-
-def enforce_cap(out_dir: Path):
-    while total_chunk_size(out_dir) > MAX_TOTAL_BYTES:
-        oldest = find_chunks(out_dir)
-        if not oldest:
-            break
-        oldest[0].unlink()
-        log.info("cap: deleted %s", oldest[0].name)
-
-
-def load_sensors(npz_path: Path) -> dict[str, dict]:
     sensors: dict[str, dict] = {}
-    if not npz_path.exists():
-        log.info("no existing chunk at %s", npz_path.name)
-        return sensors
-    try:
-        npz = np.load(npz_path)
-    except Exception as e:
-        log.error("failed to load %s: %s — starting fresh", npz_path.name, e)
-        return sensors
-    keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
-    for key in keys:
+
+    # Load current week
+    paths_to_load = [chunk_path(out_dir, week_start, week_end)]
+
+    # If we're early in the week, also load previous week for 24h coverage
+    if now - week_start < timedelta(hours=24):
+        prev_start = week_start - timedelta(days=7)
+        prev_end = week_start
+        prev = chunk_path(out_dir, prev_start, prev_end)
+        if prev.exists():
+            paths_to_load.insert(0, prev)
+
+    for npz_path in paths_to_load:
+        if not npz_path.exists():
+            continue
+        try:
+            npz = np.load(npz_path)
+        except Exception as e:
+            log.error("failed to load %s: %s", npz_path.name, e)
+            continue
+        keys = sorted({n[:-5] for n in npz.files if n.endswith("_time")})
+        for key in keys:
+            t = npz[f"{key}_time"]
+            tf = npz[f"{key}_temp_f"]
+            h = npz[f"{key}_humidity"]
+            if key in sensors:
+                # Append to existing
+                sensors[key]["time"] = np.concatenate([sensors[key]["time"], t])
+                sensors[key]["temp_f"] = np.concatenate([sensors[key]["temp_f"], tf])
+                sensors[key]["humidity"] = np.concatenate([sensors[key]["humidity"], h])
+            else:
+                sensors[key] = {"time": t, "temp_f": tf, "humidity": h}
+
+    # Filter to last 24h only
+    for key in list(sensors):
+        mask = sensors[key]["time"] >= cutoff
+        if not mask.any():
+            del sensors[key]
+            continue
         sensors[key] = {
-            "time": npz[f"{key}_time"],
-            "temp_f": npz[f"{key}_temp_f"],
-            "humidity": npz[f"{key}_humidity"],
+            "time": sensors[key]["time"][mask],
+            "temp_f": sensors[key]["temp_f"][mask],
+            "humidity": sensors[key]["humidity"][mask],
         }
-    log.info("loaded %d sensors from %s", len(keys), npz_path.name)
+
     return sensors
-
-
-def save_sensors():
-    with _lock:
-        sensors = {k: {f: v.copy() for f, v in arrs.items()} for k, arrs in _sensors.items()}
-    npz_path = chunk_path(_out_dir, _week_start, _week_end)
-    npz_data = {}
-    for key, arrs in sensors.items():
-        npz_data[f"{key}_time"] = arrs["time"]
-        npz_data[f"{key}_temp_f"] = arrs["temp_f"]
-        npz_data[f"{key}_humidity"] = arrs["humidity"]
-    if npz_data:
-        np.savez_compressed(npz_path, **npz_data)
-        total = sum(len(a["time"]) for a in sensors.values())
-        log.info("save: %d records -> %s", total, npz_path.name)
-
-
-def append_record(sensor_key: str, time_str: str, temp_f: float, humidity: float):
-    safe = sensor_key.replace(" ", "_")
-    with _lock:
-        if safe not in _sensors:
-            _sensors[safe] = {
-                "time": np.array([], dtype="U25"),
-                "temp_f": np.array([], dtype=np.float32),
-                "humidity": np.array([], dtype=np.float32),
-            }
-        s = _sensors[safe]
-        s["time"] = np.append(s["time"], time_str)
-        s["temp_f"] = np.append(s["temp_f"], np.float32(temp_f))
-        s["humidity"] = np.append(s["humidity"], np.float32(humidity))
 
 
 # --- Data access ---
@@ -173,105 +152,39 @@ def get_latest_temps() -> dict:
 
 
 def get_last_24h() -> dict:
-    cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
     with _lock:
         snapshot = {k: {f: v.copy() for f, v in arrs.items()} for k, arrs in _sensors.items()}
     result = {}
     for key, arrs in sorted(snapshot.items()):
-        mask = arrs["time"] >= cutoff
-        if not mask.any():
+        if len(arrs["time"]) == 0:
             continue
         result[key] = [
             {"time": str(t), "temp_f": round(float(tf), 2), "humidity": round(float(h), 1)}
-            for t, tf, h in zip(arrs["time"][mask], arrs["temp_f"][mask], arrs["humidity"][mask])
+            for t, tf, h in zip(arrs["time"], arrs["temp_f"], arrs["humidity"])
         ]
     return result
 
 
-# --- Stdin reader thread ---
+# --- Disk poller thread ---
 
-def stdin_reader():
-    global _version, _sensors, _week_start, _week_end
-
-    log.info("stdin reader started, waiting for data...")
-    seen: dict[str, tuple[str, float]] = {}
-    line_count = 0
-
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-
-        line_count += 1
-        if line_count == 1:
-            log.info("first stdin line received")
-        if line_count <= 3:
-            log.debug("stdin raw: %s", line[:200])
-
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            log.warning("invalid JSON on stdin: %s", line[:100])
-            continue
-
-        temp_c = msg.get("temperature_C")
-        if temp_c is None:
-            if line_count <= 5:
-                log.debug("non-temp message: model=%s", msg.get("model", "?"))
-            continue
-
-        model = msg.get("model", "unknown")
-        channel = msg.get("channel", "?")
-        sensor_key = f"{model}_ch{channel}"
-        time_str = msg.get("time", datetime.now().isoformat())
-        humidity = msg.get("humidity", float("nan"))
-
-        # Deduplicate
-        dedup = (time_str[:19], temp_c)
-        if seen.get(sensor_key) == dedup:
-            continue
-        seen[sensor_key] = dedup
-
-        # Check week boundary
-        try:
-            msg_dt = datetime.fromisoformat(time_str)
-        except ValueError:
-            msg_dt = datetime.now()
-
-        if msg_dt >= _week_end:
-            save_sensors()
-            enforce_cap(_out_dir)
-            _week_start, _week_end = week_bounds(msg_dt)
-            with _lock:
-                _sensors = load_sensors(chunk_path(_out_dir, _week_start, _week_end))
-            log.info("rotate: new chunk %s", chunk_path(_out_dir, _week_start, _week_end).name)
-
-        temp_f = round(c_to_f(temp_c), 2)
-        append_record(sensor_key, time_str, temp_f, humidity)
-
-        with _lock:
-            _version += 1
-
-        # Log latest readings
-        latest = get_latest_temps()
-        ts = time_str[11:19] if len(time_str) >= 19 else time_str
-        parts = [f"{name}: {v['temp_f']:.1f}°F {v['humidity']:.0f}%"
-                 for name, v in sorted(latest.items())]
-        log.info("%s  %s", ts, "  |  ".join(parts))
-
-    log.warning("stdin EOF — no more data")
-    save_sensors()
-
-
-# --- Save thread ---
-
-def save_loop():
+def disk_poller():
+    """Periodically reload sensor data from npz files on disk."""
+    global _sensors, _version
     while True:
-        time.sleep(SAVE_INTERVAL)
+        time.sleep(POLL_INTERVAL)
         try:
-            save_sensors()
+            new_sensors = load_sensors_from_disk(_out_dir)
+            # Check if data actually changed
+            new_count = sum(len(a["time"]) for a in new_sensors.values())
+            with _lock:
+                old_count = sum(len(a["time"]) for a in _sensors.values())
+            if new_count != old_count:
+                with _lock:
+                    _sensors = new_sensors
+                    _version += 1
+                log.info("reload: %d records from disk", new_count)
         except Exception as e:
-            log.error("save error: %s", e)
+            log.error("disk poll error: %s", e)
 
 
 # --- HTML dashboard ---
@@ -461,7 +374,6 @@ function updateCurrent(data, keys) {
     card.append("div").attr("class", "ago").attr("data-time", last.time).text(timeAgo(last.time));
   });
 
-  // Tick the "ago" labels every 5 seconds
   if (_agoIntervalId) clearInterval(_agoIntervalId);
   _agoIntervalId = setInterval(function() {
     d3.selectAll(".ago").each(function() {
@@ -554,43 +466,30 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # --- Main ---
 
 def main():
-    global _sensors, _version, _week_start, _week_end, _out_dir
+    global _sensors, _version, _out_dir
 
-    parser = argparse.ArgumentParser(description="SDR temperature server")
+    parser = argparse.ArgumentParser(description="SDR temperature web dashboard")
     parser.add_argument("--port", type=int, default=8433)
     parser.add_argument("--dir", default="sdr/sdr", help="Directory for .npz chunks")
     args = parser.parse_args()
 
     _out_dir = Path(args.dir)
-    _out_dir.mkdir(parents=True, exist_ok=True)
+    if not _out_dir.exists():
+        log.error("data directory %s does not exist", _out_dir)
+        sys.exit(1)
 
-    # Load current week's data
-    now = datetime.now()
-    _week_start, _week_end = week_bounds(now)
-    npz = chunk_path(_out_dir, _week_start, _week_end)
-    _sensors = load_sensors(npz)
-
+    # Initial load
+    _sensors = load_sensors_from_disk(_out_dir)
     n = sum(len(a["time"]) for a in _sensors.values())
-    used = total_chunk_size(_out_dir)
-    n_chunks = len(find_chunks(_out_dir))
-    log.info("loaded %d records from %s", n, npz.name)
-    log.info("storage: %.1f MB across %d chunk(s), cap %.0f GB",
-             used / 1e6, n_chunks, MAX_TOTAL_BYTES / 1e9)
+    log.info("loaded %d records (last 24h) from %s", n, _out_dir)
     _version = 1 if _sensors else 0
 
-    log.info("starting stdin reader thread...")
-    threading.Thread(target=stdin_reader, daemon=True).start()
-    log.info("starting save loop thread (interval=%ds)...", SAVE_INTERVAL)
-    threading.Thread(target=save_loop, daemon=True).start()
+    # Start disk poller
+    log.info("starting disk poller (interval=%ds)...", POLL_INTERVAL)
+    threading.Thread(target=disk_poller, daemon=True).start()
 
     def shutdown(sig, frame):
         log.info("shutdown signal received (sig=%d)", sig)
-        try:
-            sys.stdin.close()
-        except Exception:
-            pass
-        save_sensors()
-        log.info("saved. device released. exiting.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
